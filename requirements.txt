@@ -1,3 +1,6 @@
 streamlit==1.62.0
 python-dotenv==1.2.3
 volcengine-python-sdk==5.0.47
+
+httpx
+pydantic

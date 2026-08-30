@@ -157,6 +157,27 @@ def update_conversation_title(
         connection.close()
 
 
+def rename_conversation(
+    conversation_id: str,
+    visitor_id: str,
+    title: str,
+) -> bool:
+    """Rename a visitor-owned conversation and report whether it changed."""
+    sql = """
+        UPDATE conversations
+        SET title = %s, updated_at = CURRENT_TIMESTAMP
+        WHERE conversation_id = %s AND visitor_id = %s
+    """
+
+    connection = get_connection()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(sql, (title, conversation_id, visitor_id))
+            return cursor.rowcount == 1
+    finally:
+        connection.close()
+
+
 def delete_conversation(conversation_id: str, visitor_id: str) -> bool:
     """Delete a visitor-owned conversation and its messages atomically."""
     verify_ownership_sql = """

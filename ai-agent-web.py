@@ -12,6 +12,7 @@ from chat_repository import (
     get_conversations_by_visitor,
     get_latest_conversation_id,
     get_messages,
+    rename_conversation,
     save_message,
     update_conversation_title,
 )
@@ -25,6 +26,7 @@ client = Ark(api_key=api_key)
 
 SYSTEM_PROMPT = "你的名字是子昂，你的小名是克里斯蒂亚诺。无论任何时候，当用户问你叫什么、叫什么名字、你是谁时，你都回答：我叫子昂，你也可以叫我克里斯蒂亚诺，很高兴认识你。当用户问你的小名、昵称叫什么时，你必须回答：我的小名叫克里斯蒂亚诺。你需要用清晰、友好、简洁的中文回答用户的问题。不要主动说自己是豆包。"
 CONVERSATION_TITLE_MAX_LENGTH = 18
+MANUAL_TITLE_MAX_LENGTH = 30
 
 
 def create_initial_messages():
@@ -165,6 +167,7 @@ def start_new_conversation():
     st.session_state.conversation_registered = False
     st.session_state.suppress_history_restore = True
     st.session_state.messages = create_initial_messages()
+    st.session_state.renaming_conversation_id = None
     set_blank_chat_requested(True)
 
 
@@ -236,7 +239,11 @@ def update_title_for_first_user_message(first_message):
 
 def switch_conversation(conversation_id):
     """Switch conversations after confirming ownership for this visitor."""
+    was_renaming = st.session_state.get("renaming_conversation_id") is not None
+    st.session_state.renaming_conversation_id = None
     if conversation_id == st.session_state.conversation_id:
+        if was_renaming:
+            st.rerun()
         return True
 
     try:
@@ -257,6 +264,18 @@ def switch_conversation(conversation_id):
     set_blank_chat_requested(False)
     st.session_state.messages = create_messages_from_history(history)
     st.rerun()
+
+
+def rename_history_conversation(conversation_id, title):
+    """Rename one visitor-owned conversation without exposing DB errors."""
+    try:
+        return rename_conversation(
+            conversation_id=conversation_id,
+            visitor_id=st.session_state.visitor_id,
+            title=title,
+        )
+    except Exception:
+        return False
 
 
 def delete_history_conversation(conversation_id):
@@ -308,7 +327,10 @@ def show_history_sidebar():
         for conversation in conversations:
             title = conversation.get("title") or "新对话"
             conversation_id = conversation["conversation_id"]
-            title_column, delete_column = st.columns([5, 1], gap="small")
+            title_column, rename_column, delete_column = st.columns(
+                [5, 1, 1],
+                gap="small",
+            )
 
             with title_column:
                 if st.button(
@@ -319,6 +341,20 @@ def show_history_sidebar():
                     if not switch_conversation(conversation_id):
                         st.caption("该历史会话暂时无法加载。")
 
+            with rename_column:
+                if st.button(
+                    "✏️",
+                    key=f"rename_conversation_{conversation_id}",
+                    help=f"重命名会话：{title}",
+                    use_container_width=True,
+                ):
+                    st.session_state.pending_delete_conversation_id = None
+                    st.session_state.renaming_conversation_id = conversation_id
+                    st.session_state[
+                        f"rename_title_input_{conversation_id}"
+                    ] = title
+                    st.rerun()
+
             with delete_column:
                 if st.button(
                     "🗑️",
@@ -326,10 +362,56 @@ def show_history_sidebar():
                     help=f"删除会话：{title}",
                     use_container_width=True,
                 ):
+                    st.session_state.renaming_conversation_id = None
                     st.session_state.pending_delete_conversation_id = (
                         conversation_id
                     )
                     st.rerun()
+
+            if (
+                st.session_state.get("renaming_conversation_id")
+                == conversation_id
+            ):
+                input_key = f"rename_title_input_{conversation_id}"
+                edited_title = st.text_input(
+                    "会话标题",
+                    value=title,
+                    key=input_key,
+                )
+                save_column, cancel_rename_column = st.columns(2)
+
+                with save_column:
+                    if st.button(
+                        "保存",
+                        key=f"save_rename_{conversation_id}",
+                        type="primary",
+                        use_container_width=True,
+                    ):
+                        normalized_title = edited_title.strip()
+                        if not normalized_title:
+                            st.caption("标题不能为空。")
+                        elif len(normalized_title) > MANUAL_TITLE_MAX_LENGTH:
+                            st.caption("标题不能超过 30 个字符。")
+                        elif normalized_title == title:
+                            st.session_state.renaming_conversation_id = None
+                            st.rerun()
+                        elif rename_history_conversation(
+                            conversation_id,
+                            normalized_title,
+                        ):
+                            st.session_state.renaming_conversation_id = None
+                            st.rerun()
+                        else:
+                            st.caption("重命名失败，请稍后重试。")
+
+                with cancel_rename_column:
+                    if st.button(
+                        "取消",
+                        key=f"cancel_rename_{conversation_id}",
+                        use_container_width=True,
+                    ):
+                        st.session_state.renaming_conversation_id = None
+                        st.rerun()
 
             if (
                 st.session_state.get("pending_delete_conversation_id")

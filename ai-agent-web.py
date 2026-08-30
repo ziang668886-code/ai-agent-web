@@ -5,6 +5,7 @@ from dotenv import load_dotenv
 from volcenginesdkarkruntime import Ark
 
 from chat_repository import (
+    conversation_belongs_to_visitor,
     create_conversation,
     create_or_update_visitor,
     get_conversations_by_visitor,
@@ -26,6 +27,20 @@ SYSTEM_PROMPT = "你的名字是子昂，你的小名是克里斯蒂亚诺。无
 def create_initial_messages():
     """Return a fresh message list containing the system prompt."""
     return [{"role": "system", "content": SYSTEM_PROMPT}]
+
+
+def create_messages_from_history(history):
+    """Build chat messages from database history without duplicate systems."""
+    messages = create_initial_messages()
+    for message in history:
+        if message["role"] in ("user", "assistant"):
+            messages.append(
+                {
+                    "role": message["role"],
+                    "content": message["content"],
+                }
+            )
+    return messages
 
 
 def mark_database_error():
@@ -68,15 +83,7 @@ def restore_latest_conversation():
         mark_database_error()
         return False
 
-    messages = create_initial_messages()
-    for message in history:
-        if message["role"] in ("user", "assistant"):
-            messages.append(
-                {
-                    "role": message["role"],
-                    "content": message["content"],
-                }
-            )
+    messages = create_messages_from_history(history)
 
     st.session_state.conversation_id = conversation_id
     st.session_state.conversation_registered = True
@@ -137,8 +144,31 @@ def save_message_safely(role, content):
         mark_database_error()
 
 
+def switch_conversation(conversation_id):
+    """Switch conversations after confirming ownership for this visitor."""
+    if conversation_id == st.session_state.conversation_id:
+        return True
+
+    try:
+        belongs_to_visitor = conversation_belongs_to_visitor(
+            conversation_id,
+            st.session_state.visitor_id,
+        )
+        if not belongs_to_visitor:
+            return False
+
+        history = get_messages(conversation_id)
+    except Exception:
+        return False
+
+    st.session_state.conversation_id = conversation_id
+    st.session_state.conversation_registered = True
+    st.session_state.messages = create_messages_from_history(history)
+    st.rerun()
+
+
 def show_history_sidebar():
-    """Display the current visitor's conversations without switching them."""
+    """Display clickable conversations belonging to the current visitor."""
     with st.sidebar:
         st.subheader("历史会话")
 
@@ -156,7 +186,14 @@ def show_history_sidebar():
 
         for conversation in conversations:
             title = conversation.get("title") or "新对话"
-            st.write(title)
+            conversation_id = conversation["conversation_id"]
+            if st.button(
+                title,
+                key=f"history_conversation_{conversation_id}",
+                use_container_width=True,
+            ):
+                if not switch_conversation(conversation_id):
+                    st.caption("该历史会话暂时无法加载。")
 
 
 # 设置网页基本信息

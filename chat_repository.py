@@ -110,6 +110,27 @@ def get_conversations_by_visitor(visitor_id: str) -> list[dict]:
         connection.close()
 
 
+def conversation_belongs_to_visitor(
+    conversation_id: str,
+    visitor_id: str,
+) -> bool:
+    """Return whether a conversation belongs to the specified visitor."""
+    sql = """
+        SELECT 1 AS belongs
+        FROM conversations
+        WHERE conversation_id = %s AND visitor_id = %s
+        LIMIT 1
+    """
+
+    connection = get_connection()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(sql, (conversation_id, visitor_id))
+            return cursor.fetchone() is not None
+    finally:
+        connection.close()
+
+
 def get_messages(conversation_id: str) -> list[dict]:
     """Return a conversation's messages in chronological order."""
     sql = """

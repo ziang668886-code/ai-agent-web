@@ -4,3 +4,4 @@ volcengine-python-sdk==5.0.47
 
 httpx
 pydantic
+PyMySQL

@@ -12,6 +12,7 @@ from chat_repository import (
     get_latest_conversation_id,
     get_messages,
     save_message,
+    update_conversation_title,
 )
 from visitor_identity import get_or_create_visitor_id
 
@@ -22,6 +23,7 @@ api_key = os.getenv("ARK_API_KEY")
 client = Ark(api_key=api_key)
 
 SYSTEM_PROMPT = "你的名字是子昂，你的小名是克里斯蒂亚诺。无论任何时候，当用户问你叫什么、叫什么名字、你是谁时，你都回答：我叫子昂，你也可以叫我克里斯蒂亚诺，很高兴认识你。当用户问你的小名、昵称叫什么时，你必须回答：我的小名叫克里斯蒂亚诺。你需要用清晰、友好、简洁的中文回答用户的问题。不要主动说自己是豆包。"
+CONVERSATION_TITLE_MAX_LENGTH = 18
 
 
 def create_initial_messages():
@@ -41,6 +43,21 @@ def create_messages_from_history(history):
                 }
             )
     return messages
+
+
+def generate_conversation_title(first_message):
+    """Create a short title directly from the first user message."""
+    normalized_message = " ".join(first_message.split())
+    if not normalized_message:
+        return None
+
+    if len(normalized_message) > CONVERSATION_TITLE_MAX_LENGTH:
+        shortened_message = normalized_message[
+            :CONVERSATION_TITLE_MAX_LENGTH
+        ].rstrip()
+        return f"{shortened_message}..."
+
+    return normalized_message
 
 
 def mark_database_error():
@@ -132,7 +149,7 @@ def save_message_safely(role, content):
     """Save a message without allowing database errors to stop the chat."""
     if not st.session_state.get("conversation_registered", False):
         mark_database_error()
-        return
+        return False
 
     try:
         save_message(
@@ -140,8 +157,27 @@ def save_message_safely(role, content):
             role=role,
             content=content,
         )
+        return True
     except Exception:
         mark_database_error()
+        return False
+
+
+def update_title_for_first_user_message(first_message):
+    """Set the default title from the first successfully saved user message."""
+    title = generate_conversation_title(first_message)
+    if not title:
+        return False
+
+    try:
+        return update_conversation_title(
+            conversation_id=st.session_state.conversation_id,
+            visitor_id=st.session_state.visitor_id,
+            title=title,
+        )
+    except Exception:
+        mark_database_error()
+        return False
 
 
 def switch_conversation(conversation_id):
@@ -231,13 +267,20 @@ question = st.chat_input("请输入你的问题...")
 
 # 如果用户输入了内容
 if question:
+    is_first_user_message = not any(
+        message["role"] == "user"
+        for message in st.session_state.messages
+    )
     st.session_state.messages.append(
         {
             "role": "user",
             "content": question
         }
     )
-    save_message_safely("user", question)
+    user_message_saved = save_message_safely("user", question)
+    title_updated = False
+    if is_first_user_message and user_message_saved:
+        title_updated = update_title_for_first_user_message(question)
 
     # 显示用户发送的消息
     with st.chat_message("user"):
@@ -262,3 +305,6 @@ if question:
             }
         )
         save_message_safely("assistant", answer)
+
+    if title_updated:
+        st.rerun()

@@ -131,6 +131,32 @@ def conversation_belongs_to_visitor(
         connection.close()
 
 
+def update_conversation_title(
+    conversation_id: str,
+    visitor_id: str,
+    title: str,
+) -> bool:
+    """Update a visitor's conversation title while it is still the default."""
+    sql = """
+        UPDATE conversations
+        SET title = %s, updated_at = CURRENT_TIMESTAMP
+        WHERE conversation_id = %s
+          AND visitor_id = %s
+          AND (title IS NULL OR TRIM(title) = '' OR title = %s)
+    """
+
+    connection = get_connection()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                sql,
+                (title, conversation_id, visitor_id, "新对话"),
+            )
+            return cursor.rowcount > 0
+    finally:
+        connection.close()
+
+
 def get_messages(conversation_id: str) -> list[dict]:
     """Return a conversation's messages in chronological order."""
     sql = """

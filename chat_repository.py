@@ -157,6 +157,59 @@ def update_conversation_title(
         connection.close()
 
 
+def delete_conversation(conversation_id: str, visitor_id: str) -> bool:
+    """Delete a visitor-owned conversation and its messages atomically."""
+    verify_ownership_sql = """
+        SELECT conversation_id
+        FROM conversations
+        WHERE conversation_id = %s AND visitor_id = %s
+        FOR UPDATE
+    """
+    delete_messages_sql = """
+        DELETE m
+        FROM messages AS m
+        INNER JOIN conversations AS c
+            ON c.conversation_id = m.conversation_id
+        WHERE m.conversation_id = %s
+          AND c.visitor_id = %s
+    """
+    delete_conversation_sql = """
+        DELETE FROM conversations
+        WHERE conversation_id = %s AND visitor_id = %s
+    """
+
+    connection = get_connection()
+    try:
+        connection.begin()
+        with connection.cursor() as cursor:
+            cursor.execute(
+                verify_ownership_sql,
+                (conversation_id, visitor_id),
+            )
+            if cursor.fetchone() is None:
+                connection.rollback()
+                return False
+
+            cursor.execute(
+                delete_messages_sql,
+                (conversation_id, visitor_id),
+            )
+            cursor.execute(
+                delete_conversation_sql,
+                (conversation_id, visitor_id),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("Conversation deletion did not complete.")
+
+        connection.commit()
+        return True
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
 def get_messages(conversation_id: str) -> list[dict]:
     """Return a conversation's messages in chronological order."""
     sql = """

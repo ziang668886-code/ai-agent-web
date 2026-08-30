@@ -8,6 +8,7 @@ from chat_repository import (
     conversation_belongs_to_visitor,
     create_conversation,
     create_or_update_visitor,
+    delete_conversation,
     get_conversations_by_visitor,
     get_latest_conversation_id,
     get_messages,
@@ -203,6 +204,27 @@ def switch_conversation(conversation_id):
     st.rerun()
 
 
+def delete_history_conversation(conversation_id):
+    """Delete one visitor-owned conversation without exposing DB errors."""
+    try:
+        deleted = delete_conversation(
+            conversation_id=conversation_id,
+            visitor_id=st.session_state.visitor_id,
+        )
+    except Exception:
+        return False
+
+    if not deleted:
+        return False
+
+    st.session_state.pending_delete_conversation_id = None
+    if conversation_id == st.session_state.conversation_id:
+        st.session_state.messages = create_initial_messages()
+        start_new_conversation()
+
+    st.rerun()
+
+
 def show_history_sidebar():
     """Display clickable conversations belonging to the current visitor."""
     with st.sidebar:
@@ -223,13 +245,54 @@ def show_history_sidebar():
         for conversation in conversations:
             title = conversation.get("title") or "新对话"
             conversation_id = conversation["conversation_id"]
-            if st.button(
-                title,
-                key=f"history_conversation_{conversation_id}",
-                use_container_width=True,
+            title_column, delete_column = st.columns([5, 1], gap="small")
+
+            with title_column:
+                if st.button(
+                    title,
+                    key=f"history_conversation_{conversation_id}",
+                    use_container_width=True,
+                ):
+                    if not switch_conversation(conversation_id):
+                        st.caption("该历史会话暂时无法加载。")
+
+            with delete_column:
+                if st.button(
+                    "🗑️",
+                    key=f"delete_conversation_{conversation_id}",
+                    help=f"删除会话：{title}",
+                    use_container_width=True,
+                ):
+                    st.session_state.pending_delete_conversation_id = (
+                        conversation_id
+                    )
+                    st.rerun()
+
+            if (
+                st.session_state.get("pending_delete_conversation_id")
+                == conversation_id
             ):
-                if not switch_conversation(conversation_id):
-                    st.caption("该历史会话暂时无法加载。")
+                st.caption("确认删除这个会话？删除后无法恢复。")
+                confirm_column, cancel_column = st.columns(2)
+
+                with confirm_column:
+                    if st.button(
+                        "确认删除",
+                        key=f"confirm_delete_{conversation_id}",
+                        type="primary",
+                        use_container_width=True,
+                    ):
+                        if not delete_history_conversation(conversation_id):
+                            st.caption("删除失败，请稍后重试。")
+
+                with cancel_column:
+                    if st.button(
+                        "取消",
+                        key=f"cancel_delete_{conversation_id}",
+                        use_container_width=True,
+                    ):
+                        st.session_state.pending_delete_conversation_id = None
+                        st.rerun()
 
 
 # 设置网页基本信息

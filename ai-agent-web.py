@@ -7,6 +7,7 @@ from volcenginesdkarkruntime import Ark
 from chat_repository import (
     create_conversation,
     create_or_update_visitor,
+    get_conversations_by_visitor,
     get_latest_conversation_id,
     get_messages,
     save_message,
@@ -136,6 +137,28 @@ def save_message_safely(role, content):
         mark_database_error()
 
 
+def show_history_sidebar():
+    """Display the current visitor's conversations without switching them."""
+    with st.sidebar:
+        st.subheader("历史会话")
+
+        try:
+            conversations = get_conversations_by_visitor(
+                st.session_state.visitor_id
+            )
+        except Exception:
+            st.caption("历史会话暂时无法加载。")
+            return
+
+        if not conversations:
+            st.caption("暂无历史会话")
+            return
+
+        for conversation in conversations:
+            title = conversation.get("title") or "新对话"
+            st.write(title)
+
+
 # 设置网页基本信息
 st.set_page_config(
     page_title="AI 智能助手",
@@ -148,6 +171,7 @@ st.title("🤖 AI 智能助手")
 st.write("我叫子昂，你也可以叫我克里斯蒂亚诺，很高兴认识你 😊")
 
 initialize_database_session()
+show_history_sidebar()
 
 if st.button("🗑️ 清空聊天记录"):
     st.session_state.messages = create_initial_messages()

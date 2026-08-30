@@ -92,6 +92,24 @@ def get_latest_conversation_id(visitor_id: str) -> str | None:
         connection.close()
 
 
+def get_conversations_by_visitor(visitor_id: str) -> list[dict]:
+    """Return all conversations for a visitor, newest activity first."""
+    sql = """
+        SELECT conversation_id, title, created_at, updated_at
+        FROM conversations
+        WHERE visitor_id = %s
+        ORDER BY updated_at DESC
+    """
+
+    connection = get_connection()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(sql, (visitor_id,))
+            return cursor.fetchall()
+    finally:
+        connection.close()
+
+
 def get_messages(conversation_id: str) -> list[dict]:
     """Return a conversation's messages in chronological order."""
     sql = """

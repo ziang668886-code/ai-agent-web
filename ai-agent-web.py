@@ -105,6 +105,7 @@ def restore_latest_conversation():
 
     st.session_state.conversation_id = conversation_id
     st.session_state.conversation_registered = True
+    st.session_state.suppress_history_restore = False
     st.session_state.messages = messages
     return True
 
@@ -113,6 +114,9 @@ def initialize_database_session():
     """Prepare visitor and conversation IDs for this Streamlit session."""
     if "database_warning" not in st.session_state:
         st.session_state.database_warning = False
+
+    if "suppress_history_restore" not in st.session_state:
+        st.session_state.suppress_history_restore = False
 
     if "visitor_id" not in st.session_state:
         st.session_state.visitor_id = get_or_create_visitor_id()
@@ -123,27 +127,47 @@ def initialize_database_session():
 
     if "conversation_id" not in st.session_state:
         restored = False
-        if st.session_state.get("visitor_registered", False):
+        if (
+            st.session_state.get("visitor_registered", False)
+            and not st.session_state.suppress_history_restore
+        ):
             restored = restore_latest_conversation()
 
         if not restored:
-            st.session_state.conversation_id = str(uuid.uuid4())
+            st.session_state.conversation_id = None
             st.session_state.conversation_registered = False
-
-    if (
-        st.session_state.get("visitor_registered", False)
-        and not st.session_state.get("conversation_registered", False)
-    ):
-        create_current_conversation()
+            st.session_state.suppress_history_restore = True
 
 
 def start_new_conversation():
-    """Start a new conversation without deleting previous database records."""
-    st.session_state.conversation_id = str(uuid.uuid4())
+    """Show a blank chat without creating a database conversation yet."""
+    st.session_state.conversation_id = None
     st.session_state.conversation_registered = False
+    st.session_state.suppress_history_restore = True
+    st.session_state.messages = create_initial_messages()
 
-    if st.session_state.get("visitor_registered", False):
-        create_current_conversation()
+
+def ensure_current_conversation():
+    """Create the database conversation when the user first sends a message."""
+    if (
+        st.session_state.get("conversation_registered", False)
+        and st.session_state.get("conversation_id")
+    ):
+        return True
+
+    if not st.session_state.get("visitor_registered", False):
+        mark_database_error()
+        return False
+
+    if not st.session_state.get("conversation_id"):
+        st.session_state.conversation_id = str(uuid.uuid4())
+
+    create_current_conversation()
+    if st.session_state.get("conversation_registered", False):
+        st.session_state.suppress_history_restore = False
+        return True
+
+    return False
 
 
 def save_message_safely(role, content):
@@ -200,6 +224,7 @@ def switch_conversation(conversation_id):
 
     st.session_state.conversation_id = conversation_id
     st.session_state.conversation_registered = True
+    st.session_state.suppress_history_restore = False
     st.session_state.messages = create_messages_from_history(history)
     st.rerun()
 
@@ -219,7 +244,6 @@ def delete_history_conversation(conversation_id):
 
     st.session_state.pending_delete_conversation_id = None
     if conversation_id == st.session_state.conversation_id:
-        st.session_state.messages = create_initial_messages()
         start_new_conversation()
 
     st.rerun()
@@ -310,7 +334,6 @@ initialize_database_session()
 show_history_sidebar()
 
 if st.button("🗑️ 清空聊天记录"):
-    st.session_state.messages = create_initial_messages()
     start_new_conversation()
     st.rerun()
 
@@ -330,10 +353,16 @@ question = st.chat_input("请输入你的问题...")
 
 # 如果用户输入了内容
 if question:
-    is_first_user_message = not any(
-        message["role"] == "user"
-        for message in st.session_state.messages
+    is_first_user_message = (
+        not st.session_state.get("conversation_registered", False)
+        or not any(
+            message["role"] == "user"
+            for message in st.session_state.messages
+        )
     )
+    if not st.session_state.get("conversation_registered", False):
+        ensure_current_conversation()
+
     st.session_state.messages.append(
         {
             "role": "user",

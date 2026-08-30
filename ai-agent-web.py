@@ -1,13 +1,96 @@
 import streamlit as st
 import os
+import uuid
 from dotenv import load_dotenv
 from volcenginesdkarkruntime import Ark
+
+from chat_repository import (
+    create_conversation,
+    create_or_update_visitor,
+    save_message,
+)
 
 load_dotenv()
 
 api_key = os.getenv("ARK_API_KEY")
 
 client = Ark(api_key=api_key)
+
+
+def mark_database_error():
+    """Record a database failure without interrupting the chat experience."""
+    st.session_state.database_warning = True
+
+
+def register_current_visitor():
+    """Create or refresh the current visitor in MySQL."""
+    try:
+        create_or_update_visitor(st.session_state.visitor_id)
+        st.session_state.visitor_registered = True
+    except Exception:
+        mark_database_error()
+
+
+def create_current_conversation():
+    """Create the current conversation in MySQL when possible."""
+    try:
+        create_conversation(
+            visitor_id=st.session_state.visitor_id,
+            conversation_id=st.session_state.conversation_id,
+        )
+        st.session_state.conversation_registered = True
+    except Exception:
+        mark_database_error()
+
+
+def initialize_database_session():
+    """Prepare visitor and conversation IDs for this Streamlit session."""
+    if "database_warning" not in st.session_state:
+        st.session_state.database_warning = False
+
+    if "visitor_id" not in st.session_state:
+        st.session_state.visitor_id = str(uuid.uuid4())
+        st.session_state.visitor_registered = False
+
+    if not st.session_state.get("visitor_registered", False):
+        register_current_visitor()
+
+    if "conversation_id" not in st.session_state:
+        st.session_state.conversation_id = str(uuid.uuid4())
+        st.session_state.conversation_registered = False
+
+    if (
+        st.session_state.get("visitor_registered", False)
+        and not st.session_state.get("conversation_registered", False)
+    ):
+        create_current_conversation()
+
+
+def start_new_conversation():
+    """Start a new conversation without deleting previous database records."""
+    st.session_state.conversation_id = str(uuid.uuid4())
+    st.session_state.conversation_registered = False
+
+    if st.session_state.get("visitor_registered", False):
+        create_current_conversation()
+
+
+def save_message_safely(role, content):
+    """Save a message without allowing database errors to stop the chat."""
+    if not st.session_state.get("conversation_registered", False):
+        mark_database_error()
+        return
+
+    try:
+        save_message(
+            conversation_id=st.session_state.conversation_id,
+            role=role,
+            content=content,
+        )
+    except Exception:
+        mark_database_error()
+
+
 # 设置网页基本信息
 st.set_page_config(
     page_title="AI 智能助手",
@@ -19,6 +102,8 @@ st.title("🤖 AI 智能助手")
 
 st.write("我叫子昂，你也可以叫我克里斯蒂亚诺，很高兴认识你 😊")
 
+initialize_database_session()
+
 if st.button("🗑️ 清空聊天记录"):
     st.session_state.messages = [
         {
@@ -26,7 +111,11 @@ if st.button("🗑️ 清空聊天记录"):
             "content": "你的名字是子昂，你的小名是克里斯蒂亚诺。无论任何时候，当用户问你叫什么、叫什么名字、你是谁时，你都回答：我叫子昂，你也可以叫我克里斯蒂亚诺，很高兴认识你。当用户问你的小名、昵称叫什么时，你必须回答：我的小名叫克里斯蒂亚诺。你需要用清晰、友好、简洁的中文回答用户的问题。不要主动说自己是豆包。"
         }
     ]
+    start_new_conversation()
     st.rerun()
+
+if st.session_state.get("database_warning", False):
+    st.caption("⚠️ 聊天记录暂时无法保存，但不影响 AI 对话功能。")
 
 # 初始化聊天记录
 if "messages" not in st.session_state:
@@ -52,6 +141,8 @@ if question:
             "content": question
         }
     )
+    save_message_safely("user", question)
+
     # 显示用户发送的消息
     with st.chat_message("user"):
         st.write(question)
@@ -74,3 +165,4 @@ if question:
                 "content": answer
             }
         )
+        save_message_safely("assistant", answer)

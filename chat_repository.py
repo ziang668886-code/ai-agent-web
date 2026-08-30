@@ -72,6 +72,26 @@ def save_message(conversation_id: str, role: str, content: str) -> int:
         connection.close()
 
 
+def get_latest_conversation_id(visitor_id: str) -> str | None:
+    """Return the visitor's most recently updated conversation ID."""
+    sql = """
+        SELECT conversation_id
+        FROM conversations
+        WHERE visitor_id = %s
+        ORDER BY updated_at DESC, created_at DESC
+        LIMIT 1
+    """
+
+    connection = get_connection()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(sql, (visitor_id,))
+            row = cursor.fetchone()
+            return row["conversation_id"] if row else None
+    finally:
+        connection.close()
+
+
 def get_messages(conversation_id: str) -> list[dict]:
     """Return a conversation's messages in chronological order."""
     sql = """

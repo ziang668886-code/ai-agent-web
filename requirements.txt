@@ -5,3 +5,4 @@ volcengine-python-sdk==5.0.47
 httpx
 pydantic
 PyMySQL
+streamlit-cookies-controller==0.0.4

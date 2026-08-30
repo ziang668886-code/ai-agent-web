@@ -7,14 +7,24 @@ from volcenginesdkarkruntime import Ark
 from chat_repository import (
     create_conversation,
     create_or_update_visitor,
+    get_latest_conversation_id,
+    get_messages,
     save_message,
 )
+from visitor_identity import get_or_create_visitor_id
 
 load_dotenv()
 
 api_key = os.getenv("ARK_API_KEY")
 
 client = Ark(api_key=api_key)
+
+SYSTEM_PROMPT = "你的名字是子昂，你的小名是克里斯蒂亚诺。无论任何时候，当用户问你叫什么、叫什么名字、你是谁时，你都回答：我叫子昂，你也可以叫我克里斯蒂亚诺，很高兴认识你。当用户问你的小名、昵称叫什么时，你必须回答：我的小名叫克里斯蒂亚诺。你需要用清晰、友好、简洁的中文回答用户的问题。不要主动说自己是豆包。"
+
+
+def create_initial_messages():
+    """Return a fresh message list containing the system prompt."""
+    return [{"role": "system", "content": SYSTEM_PROMPT}]
 
 
 def mark_database_error():
@@ -43,21 +53,56 @@ def create_current_conversation():
         mark_database_error()
 
 
+def restore_latest_conversation():
+    """Restore the current visitor's latest conversation and messages."""
+    try:
+        conversation_id = get_latest_conversation_id(
+            st.session_state.visitor_id
+        )
+        if not conversation_id:
+            return False
+
+        history = get_messages(conversation_id)
+    except Exception:
+        mark_database_error()
+        return False
+
+    messages = create_initial_messages()
+    for message in history:
+        if message["role"] in ("user", "assistant"):
+            messages.append(
+                {
+                    "role": message["role"],
+                    "content": message["content"],
+                }
+            )
+
+    st.session_state.conversation_id = conversation_id
+    st.session_state.conversation_registered = True
+    st.session_state.messages = messages
+    return True
+
+
 def initialize_database_session():
     """Prepare visitor and conversation IDs for this Streamlit session."""
     if "database_warning" not in st.session_state:
         st.session_state.database_warning = False
 
     if "visitor_id" not in st.session_state:
-        st.session_state.visitor_id = str(uuid.uuid4())
+        st.session_state.visitor_id = get_or_create_visitor_id()
         st.session_state.visitor_registered = False
 
     if not st.session_state.get("visitor_registered", False):
         register_current_visitor()
 
     if "conversation_id" not in st.session_state:
-        st.session_state.conversation_id = str(uuid.uuid4())
-        st.session_state.conversation_registered = False
+        restored = False
+        if st.session_state.get("visitor_registered", False):
+            restored = restore_latest_conversation()
+
+        if not restored:
+            st.session_state.conversation_id = str(uuid.uuid4())
+            st.session_state.conversation_registered = False
 
     if (
         st.session_state.get("visitor_registered", False)
@@ -105,12 +150,7 @@ st.write("我叫子昂，你也可以叫我克里斯蒂亚诺，很高兴认识�
 initialize_database_session()
 
 if st.button("🗑️ 清空聊天记录"):
-    st.session_state.messages = [
-        {
-            "role": "system",
-            "content": "你的名字是子昂，你的小名是克里斯蒂亚诺。无论任何时候，当用户问你叫什么、叫什么名字、你是谁时，你都回答：我叫子昂，你也可以叫我克里斯蒂亚诺，很高兴认识你。当用户问你的小名、昵称叫什么时，你必须回答：我的小名叫克里斯蒂亚诺。你需要用清晰、友好、简洁的中文回答用户的问题。不要主动说自己是豆包。"
-        }
-    ]
+    st.session_state.messages = create_initial_messages()
     start_new_conversation()
     st.rerun()
 
@@ -119,12 +159,7 @@ if st.session_state.get("database_warning", False):
 
 # 初始化聊天记录
 if "messages" not in st.session_state:
-    st.session_state.messages = [
-        {
-            "role": "system",
-            "content": "你的名字是子昂，你的小名是克里斯蒂亚诺。无论任何时候，当用户问你叫什么、叫什么名字、你是谁时，你都回答：我叫子昂，你也可以叫我克里斯蒂亚诺，很高兴认识你。当用户问你的小名、昵称叫什么时，你必须回答：我的小名叫克里斯蒂亚诺。你需要用清晰、友好、简洁的中文回答用户的问题。不要主动说自己是豆包。"
-        }
-    ]
+    st.session_state.messages = create_initial_messages()
 # 显示历史聊天记录
 for message in st.session_state.messages:
     if message["role"] != "system":

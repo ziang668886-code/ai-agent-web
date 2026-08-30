@@ -32,6 +32,22 @@ def create_initial_messages():
     return [{"role": "system", "content": SYSTEM_PROMPT}]
 
 
+def blank_chat_requested():
+    """Return whether the URL requests a persistent blank chat page."""
+    return st.query_params.get("new_chat") == "1"
+
+
+def set_blank_chat_requested(requested):
+    """Persist or clear the blank-chat marker without storing identity data."""
+    try:
+        if requested:
+            st.query_params["new_chat"] = "1"
+        else:
+            st.query_params.pop("new_chat", None)
+    except Exception:
+        pass
+
+
 def create_messages_from_history(history):
     """Build chat messages from database history without duplicate systems."""
     messages = create_initial_messages()
@@ -106,6 +122,7 @@ def restore_latest_conversation():
     st.session_state.conversation_id = conversation_id
     st.session_state.conversation_registered = True
     st.session_state.suppress_history_restore = False
+    set_blank_chat_requested(False)
     st.session_state.messages = messages
     return True
 
@@ -115,8 +132,11 @@ def initialize_database_session():
     if "database_warning" not in st.session_state:
         st.session_state.database_warning = False
 
+    url_requests_blank_chat = blank_chat_requested()
     if "suppress_history_restore" not in st.session_state:
-        st.session_state.suppress_history_restore = False
+        st.session_state.suppress_history_restore = url_requests_blank_chat
+    elif url_requests_blank_chat:
+        st.session_state.suppress_history_restore = True
 
     if "visitor_id" not in st.session_state:
         st.session_state.visitor_id = get_or_create_visitor_id()
@@ -145,6 +165,14 @@ def start_new_conversation():
     st.session_state.conversation_registered = False
     st.session_state.suppress_history_restore = True
     st.session_state.messages = create_initial_messages()
+    set_blank_chat_requested(True)
+
+
+def start_new_chat():
+    """Open a blank chat while preserving all existing conversation history."""
+    st.session_state.pending_delete_conversation_id = None
+    start_new_conversation()
+    st.rerun()
 
 
 def ensure_current_conversation():
@@ -165,6 +193,7 @@ def ensure_current_conversation():
     create_current_conversation()
     if st.session_state.get("conversation_registered", False):
         st.session_state.suppress_history_restore = False
+        set_blank_chat_requested(False)
         return True
 
     return False
@@ -225,6 +254,7 @@ def switch_conversation(conversation_id):
     st.session_state.conversation_id = conversation_id
     st.session_state.conversation_registered = True
     st.session_state.suppress_history_restore = False
+    set_blank_chat_requested(False)
     st.session_state.messages = create_messages_from_history(history)
     st.rerun()
 
@@ -252,6 +282,15 @@ def delete_history_conversation(conversation_id):
 def show_history_sidebar():
     """Display clickable conversations belonging to the current visitor."""
     with st.sidebar:
+        if st.button(
+            "➕ 新建聊天",
+            key="new_chat",
+            type="primary",
+            use_container_width=True,
+        ):
+            start_new_chat()
+
+        st.divider()
         st.subheader("历史会话")
 
         try:

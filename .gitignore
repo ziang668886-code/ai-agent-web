@@ -28,3 +28,10 @@ htmlcov/
 .DS_Store
 Thumbs.db
 streamlit.log
+
+# Local RAG knowledge-base indexes
+data/knowledge_bases/
+
+# Local RAG test documents
+7.27-7.31工作内容.pdf
+AI应用开发常用知识库_RAG测试版.pdf

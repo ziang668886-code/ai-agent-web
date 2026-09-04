@@ -1,4 +1,5 @@
 import streamlit as st
+import hashlib
 import os
 import uuid
 from dotenv import load_dotenv
@@ -17,6 +18,16 @@ from chat_repository import (
     update_conversation_title,
 )
 from visitor_identity import get_or_create_visitor_id
+from embedding_service import EmbeddingServiceError, embed_chunks, embed_text
+from pdf_processor import PDFProcessingError, SCANNED_PDF_ERROR, process_pdf
+from rag_service import answer_with_rag
+from vector_store import (
+    VectorStoreError,
+    add_chunks,
+    has_document,
+    has_knowledge_base,
+    search,
+)
 
 load_dotenv()
 
@@ -27,6 +38,9 @@ client = Ark(api_key=api_key)
 SYSTEM_PROMPT = "你的名字是子昂，你的小名是克里斯蒂亚诺。无论任何时候，当用户问你叫什么、叫什么名字、你是谁时，你都回答：我叫子昂，你也可以叫我克里斯蒂亚诺，很高兴认识你。当用户问你的小名、昵称叫什么时，你必须回答：我的小名叫克里斯蒂亚诺。你需要用清晰、友好、简洁的中文回答用户的问题。不要主动说自己是豆包。"
 CONVERSATION_TITLE_MAX_LENGTH = 18
 MANUAL_TITLE_MAX_LENGTH = 30
+MAX_PDF_SIZE_BYTES = 10 * 1024 * 1024
+RAG_ROUTING_THRESHOLD = 0.35
+RAG_TOP_K = 4
 
 
 def create_initial_messages():
@@ -440,6 +454,139 @@ def show_history_sidebar():
                         st.rerun()
 
 
+def show_knowledge_base_sidebar():
+    """Display PDF upload controls for the current visitor's knowledge base."""
+    with st.sidebar:
+        st.divider()
+        st.subheader("📚 我的知识库")
+
+        try:
+            if has_knowledge_base(st.session_state.visitor_id):
+                st.caption("📚 当前知识库已建立")
+        except Exception:
+            st.caption("知识库状态暂时无法读取。")
+
+        uploaded_pdf = st.file_uploader(
+            "上传 PDF",
+            type=["pdf"],
+            accept_multiple_files=False,
+            key="knowledge_base_pdf_uploader",
+        )
+        st.caption("当前仅支持可以复制文字的 PDF，暂不支持纯扫描件。")
+
+        pdf_too_large = bool(
+            uploaded_pdf
+            and uploaded_pdf.size > MAX_PDF_SIZE_BYTES
+        )
+        if pdf_too_large:
+            st.error("PDF 文件不能超过 10MB。")
+
+        add_to_knowledge_base = st.button(
+            "📥 添加到知识库",
+            key="add_pdf_to_knowledge_base",
+            use_container_width=True,
+            disabled=uploaded_pdf is None or pdf_too_large,
+        )
+        if not add_to_knowledge_base or pdf_too_large:
+            return
+
+        pdf_bytes = uploaded_pdf.getvalue()
+        document_id = hashlib.sha256(pdf_bytes).hexdigest()
+        visitor_id = st.session_state.visitor_id
+
+        try:
+            if has_document(visitor_id, document_id):
+                st.info("ℹ️ 该文档已经存在于知识库中，无需重复添加。")
+                return
+        except Exception:
+            st.error("知识库状态检查失败，请稍后重试。")
+            return
+
+        try:
+            pdf_result = process_pdf(
+                pdf_bytes,
+                source_file=uploaded_pdf.name,
+            )
+        except PDFProcessingError as exc:
+            if str(exc) == SCANNED_PDF_ERROR:
+                st.error(SCANNED_PDF_ERROR)
+            else:
+                st.error("PDF 解析失败，请确认文件完整且包含可复制文字。")
+            return
+        except Exception:
+            st.error("PDF 解析失败，请确认文件完整且包含可复制文字。")
+            return
+
+        try:
+            with st.spinner("正在生成知识库索引，请稍候..."):
+                embeddings = embed_chunks(pdf_result["chunks"])
+        except (EmbeddingServiceError, ValueError):
+            st.error("文本向量生成失败，请稍后重试。")
+            return
+        except Exception:
+            st.error("文本向量生成失败，请稍后重试。")
+            return
+
+        try:
+            add_chunks(visitor_id, pdf_result["chunks"], embeddings)
+        except (VectorStoreError, ValueError):
+            st.error("知识库索引保存失败，请稍后重试。")
+            return
+        except Exception:
+            st.error("知识库索引保存失败，请稍后重试。")
+            return
+
+        st.success("✅ 已添加到知识库")
+        st.write(f"文件：{pdf_result['source_file']}")
+        st.write(f"页数：{pdf_result['total_pages']}")
+        st.write(f"Chunk：{len(pdf_result['chunks'])}")
+
+
+def get_rag_retrieval_results(question):
+    """Route one question using the current visitor's knowledge base."""
+    try:
+        if not has_knowledge_base(st.session_state.visitor_id):
+            return None, False
+
+        query_embedding = embed_text(question)
+        retrieval_results = search(
+            st.session_state.visitor_id,
+            query_embedding,
+            top_k=RAG_TOP_K,
+        )
+        if (
+            retrieval_results
+            and float(retrieval_results[0]["score"])
+            >= RAG_ROUTING_THRESHOLD
+        ):
+            return retrieval_results, False
+    except Exception:
+        return None, True
+
+    return None, False
+
+
+def add_sources_to_answer(answer, sources):
+    """Append deduplicated, display-safe source labels to a RAG answer."""
+    source_lines = []
+    seen_sources = set()
+    for source in sources:
+        source_key = (
+            source["source_file"],
+            source["page_number"],
+        )
+        if source_key in seen_sources:
+            continue
+        seen_sources.add(source_key)
+        source_lines.append(
+            f"- {source['source_file']} · 第{source['page_number']}页"
+        )
+
+    if not source_lines:
+        return answer
+    return f"{answer.rstrip()}\n\n📎 来源：\n\n" + "\n".join(source_lines)
+
+
 # 设置网页基本信息
 st.set_page_config(
     page_title="AI 智能助手",
@@ -453,6 +600,7 @@ st.write("我叫子昂，你也可以叫我克里斯蒂亚诺，很高兴认识�
 
 initialize_database_session()
 show_history_sidebar()
+show_knowledge_base_sidebar()
 
 if st.button("🗑️ 清空聊天记录"):
     start_new_conversation()
@@ -499,13 +647,30 @@ if question:
     with st.chat_message("user"):
         st.write(question)
 
-    with st.spinner("🤔 子昂正在思考..."):
-        response = client.chat.completions.create(
-            model="doubao-seed-2-0-lite-260215",
-            messages=st.session_state.messages
-        )
+    retrieval_results, retrieval_failed = get_rag_retrieval_results(question)
+    if retrieval_failed:
+        st.caption("知识库检索暂时不可用，本次已使用普通回答。")
 
-        answer = response.choices[0].message.content
+    with st.spinner("🤔 子昂正在思考..."):
+        if retrieval_results:
+            rag_result = answer_with_rag(
+                visitor_id=st.session_state.visitor_id,
+                user_question=question,
+                chat_messages=st.session_state.messages,
+                top_k=RAG_TOP_K,
+                retrieval_results=retrieval_results,
+            )
+            answer = add_sources_to_answer(
+                rag_result["answer"],
+                rag_result["sources"],
+            )
+        else:
+            response = client.chat.completions.create(
+                model="doubao-seed-2-0-lite-260215",
+                messages=st.session_state.messages
+            )
+
+            answer = response.choices[0].message.content
     # 暂时模拟 AI 回复
     with st.chat_message("assistant"):
         st.write(answer)

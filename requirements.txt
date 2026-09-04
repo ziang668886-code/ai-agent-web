@@ -6,3 +6,6 @@ httpx
 pydantic
 PyMySQL
 streamlit-cookies-controller==0.0.4
+pypdf
+numpy
+filelock

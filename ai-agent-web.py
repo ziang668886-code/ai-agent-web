@@ -18,6 +18,7 @@ from chat_repository import (
     update_conversation_title,
 )
 from visitor_identity import get_or_create_visitor_id
+from agent_service import run_agent_turn
 from embedding_service import EmbeddingServiceError, embed_chunks, embed_text
 from pdf_processor import PDFProcessingError, SCANNED_PDF_ERROR, process_pdf
 from rag_service import answer_with_rag
@@ -647,34 +648,28 @@ if question:
     with st.chat_message("user"):
         st.write(question)
 
-    retrieval_results, retrieval_failed = get_rag_retrieval_results(question)
-    if retrieval_failed:
-        st.caption("知识库检索暂时不可用，本次已使用普通回答。")
-
     with st.spinner("🤔 子昂正在思考..."):
-        if retrieval_results:
-            rag_result = answer_with_rag(
+        try:
+            agent_result = run_agent_turn(
                 visitor_id=st.session_state.visitor_id,
                 user_question=question,
                 chat_messages=st.session_state.messages,
-                top_k=RAG_TOP_K,
-                retrieval_results=retrieval_results,
             )
+        except Exception:
+            agent_result = {"ok": False}
+
+    if not agent_result.get("ok", False):
+        st.error("AI 服务暂时不可用，请稍后重试。")
+    else:
+        answer = agent_result["answer"]
+        if agent_result.get("mode") == "tool" and agent_result.get("sources"):
             answer = add_sources_to_answer(
-                rag_result["answer"],
-                rag_result["sources"],
-            )
-        else:
-            response = client.chat.completions.create(
-                model="doubao-seed-2-0-lite-260215",
-                messages=st.session_state.messages
+                answer,
+                agent_result["sources"],
             )
 
-            answer = response.choices[0].message.content
-    # 暂时模拟 AI 回复
-    with st.chat_message("assistant"):
-        st.write(answer)
-
+        with st.chat_message("assistant"):
+            st.write(answer)
 
         st.session_state.messages.append(
             {
@@ -684,5 +679,5 @@ if question:
         )
         save_message_safely("assistant", answer)
 
-    if title_updated:
-        st.rerun()
+        if title_updated:
+            st.rerun()

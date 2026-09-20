@@ -17,16 +17,40 @@ from knowledge_base_tool import (
     KNOWLEDGE_BASE_SEARCH_TOOL,
     knowledge_base_search,
 )
+from poi_tool import SEARCH_POI_TOOL, search_poi
 from rag_service import CHAT_MODEL
 from weather_tool import GET_WEATHER_TOOL, get_weather
 
 
 KNOWLEDGE_BASE_TOOL_NAME = "knowledge_base_search"
 WEATHER_TOOL_NAME = "get_weather"
+POI_TOOL_NAME = "search_poi"
 # Backwards-compatible name used by existing tests and callers.
 TOOL_NAME = KNOWLEDGE_BASE_TOOL_NAME
-SUPPORTED_TOOL_NAMES = {KNOWLEDGE_BASE_TOOL_NAME, WEATHER_TOOL_NAME}
+SUPPORTED_TOOL_NAMES = {
+    KNOWLEDGE_BASE_TOOL_NAME,
+    WEATHER_TOOL_NAME,
+    POI_TOOL_NAME,
+}
 MAX_TOOL_CALLS_PER_TURN = 1
+
+TOOL_ARGUMENT_SCHEMAS = {
+    KNOWLEDGE_BASE_TOOL_NAME: {
+        "allowed_fields": {"query"},
+        "required_fields": {"query"},
+        "optional_fields": set(),
+    },
+    WEATHER_TOOL_NAME: {
+        "allowed_fields": {"location"},
+        "required_fields": {"location"},
+        "optional_fields": set(),
+    },
+    POI_TOOL_NAME: {
+        "allowed_fields": {"query", "city", "anchor"},
+        "required_fields": {"query", "city"},
+        "optional_fields": {"anchor"},
+    },
+}
 
 FORCED_KNOWLEDGE_BASE_TOOL_CHOICE = {
     "type": "function",
@@ -94,7 +118,13 @@ SOURCE_SECTION_HEADERS = {
 
 TOOL_SAFETY_INSTRUCTION = (
     "你可以使用知识库搜索工具查询当前用户上传的 PDF，也可以使用天气工具"
-    "查询实时天气。实时天气问题应调用 get_weather，并且必须严格以工具结果"
+    "查询实时天气，还可以使用 search_poi 搜索真实的餐厅、咖啡店、景点、"
+    "商场和其他城市地点。需要真实、当前的地点数据时应优先使用 search_poi，"
+    "不得依靠训练记忆编造当前商户。地点工具没有返回的评分、人均、距离、"
+    "标签或营业时间不得猜测；可以基于真实工具数据给出推荐理由，但必须区分"
+    "地图数据与模型的综合判断。用户只说“附近”但没有提供城市、地标或可靠"
+    "定位时，不得根据 IP、Cookie、visitor_id 或服务器位置猜测，应请用户补充"
+    "城市或地标。实时天气问题应调用 get_weather，并且必须严格以工具结果"
     "为准；如果天气工具返回失败、暂时不可用或地点无效，不得根据训练知识"
     "猜测当前天气，只能说明天气服务暂时不可用或请用户提供更明确的地点。"
     "get_weather 只支持当前实时天气，不支持明天、后天或未来预报，不能用"
@@ -356,20 +386,26 @@ def _parse_tool_arguments(arguments: Any, tool_name: str) -> dict[str, str]:
     except (json.JSONDecodeError, TypeError, ValueError):
         raise ToolDispatchError("invalid_tool_arguments", "工具参数无效。")
 
-    expected_fields = {
-        KNOWLEDGE_BASE_TOOL_NAME: {"query"},
-        WEATHER_TOOL_NAME: {"location"},
-    }
-    if tool_name not in expected_fields:
+    schema = TOOL_ARGUMENT_SCHEMAS.get(tool_name)
+    if schema is None:
         raise ToolDispatchError("unknown_tool", "模型请求了不支持的工具。")
-    if not isinstance(parsed, dict) or set(parsed) != expected_fields[tool_name]:
+    if not isinstance(parsed, dict):
+        raise ToolDispatchError("invalid_tool_arguments", "工具参数无效。")
+    fields = set(parsed)
+    allowed_fields = schema["allowed_fields"]
+    required_fields = schema["required_fields"]
+    optional_fields = schema["optional_fields"]
+    if allowed_fields != required_fields | optional_fields:
+        raise RuntimeError("Tool argument schema is inconsistent")
+    if fields - allowed_fields or not required_fields.issubset(fields):
         raise ToolDispatchError("invalid_tool_arguments", "工具参数无效。")
 
-    field = next(iter(expected_fields[tool_name]))
-    value = parsed.get(field)
-    if not isinstance(value, str) or not value.strip():
-        raise ToolDispatchError("invalid_tool_arguments", "工具参数无效。")
-    return {field: value.strip()}
+    normalized: dict[str, str] = {}
+    for field, value in parsed.items():
+        if not isinstance(value, str) or not value.strip():
+            raise ToolDispatchError("invalid_tool_arguments", "工具参数无效。")
+        normalized[field] = value.strip()
+    return normalized
 
 
 def execute_tool_call(
@@ -388,6 +424,12 @@ def execute_tool_call(
         )
     if tool_name == WEATHER_TOOL_NAME:
         return get_weather(location=parsed["location"])
+    if tool_name == POI_TOOL_NAME:
+        return search_poi(
+            query=parsed["query"],
+            city=parsed["city"],
+            anchor=parsed.get("anchor"),
+        )
     # Defense in depth if the whitelist and dispatch table ever diverge.
     raise ToolDispatchError("unknown_tool", "模型请求了不支持的工具。")
 
@@ -418,7 +460,11 @@ def _create_completion(client: Ark, messages: list[dict], tool_choice: Any) -> A
     return client.chat.completions.create(
         model=CHAT_MODEL,
         messages=messages,
-        tools=[KNOWLEDGE_BASE_SEARCH_TOOL, GET_WEATHER_TOOL],
+        tools=[
+            KNOWLEDGE_BASE_SEARCH_TOOL,
+            GET_WEATHER_TOOL,
+            SEARCH_POI_TOOL,
+        ],
         tool_choice=tool_choice,
         parallel_tool_calls=False,
     )

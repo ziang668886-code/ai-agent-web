@@ -111,6 +111,41 @@ def weather_status(status: str) -> dict:
     }
 
 
+def poi_status(status: str = "results") -> dict:
+    if status == "results":
+        return {
+            "ok": True,
+            "status": "results",
+            "query": "餐厅",
+            "city": "北京",
+            "search_mode": "nearby",
+            "anchor": "故宫",
+            "result_count": 1,
+            "results": [
+                {
+                    "rank": 1,
+                    "name": "景运门故宫餐厅",
+                    "address": "故宫博物院内",
+                    "district": "东城区",
+                    "category": "餐饮服务;中餐厅",
+                    "distance_m": 142,
+                    "rating": 3.9,
+                    "cost_per_person": 63,
+                    "tags": ["中餐"],
+                    "opening_hours": "08:30-15:30",
+                    "location": {"longitude": 116.398455, "latitude": 39.918509},
+                }
+            ],
+        }
+    return {
+        "ok": False,
+        "status": status,
+        "error_code": "POI_API_UNAVAILABLE",
+        "message": "地点搜索服务暂时不可用。",
+        "results": [],
+    }
+
+
 class AgentServiceTests(unittest.TestCase):
     def setUp(self):
         self.messages = [
@@ -145,7 +180,7 @@ class AgentServiceTests(unittest.TestCase):
         )
         search_tool.assert_not_called()
 
-    def test_both_tools_are_registered_and_parallel_calls_are_disabled(self):
+    def test_all_tools_are_registered_and_parallel_calls_are_disabled(self):
         client = make_client(response_with_content("普通回答"))
         with patch.object(service, "_get_chat_client", return_value=client):
             service.run_agent_turn(
@@ -164,6 +199,7 @@ class AgentServiceTests(unittest.TestCase):
             [
                 service.KNOWLEDGE_BASE_TOOL_NAME,
                 service.WEATHER_TOOL_NAME,
+                service.POI_TOOL_NAME,
             ],
         )
         self.assertEqual(call.kwargs["tool_choice"], "auto")
@@ -748,6 +784,136 @@ class AgentServiceTests(unittest.TestCase):
         self.assertTrue(any(message.get("tool_calls") for message in second_messages))
         self.assertTrue(any(message.get("role") == "tool" for message in second_messages))
         self.assertFalse(any(message.get("role") == "tool" for message in self.messages))
+
+    @patch.object(service, "search_poi", return_value=poi_status())
+    def test_poi_city_search_arguments_are_dispatched(self, poi_tool):
+        result = service.execute_tool_call(
+            service.POI_TOOL_NAME,
+            '{"query":"  咖啡店  ","city":"  郑州  "}',
+            TEST_VISITOR_ID,
+        )
+
+        self.assertEqual(result["status"], "results")
+        poi_tool.assert_called_once_with(
+            query="咖啡店",
+            city="郑州",
+            anchor=None,
+        )
+
+    @patch.object(service, "search_poi", return_value=poi_status())
+    def test_poi_nearby_arguments_include_optional_anchor(self, poi_tool):
+        service.execute_tool_call(
+            service.POI_TOOL_NAME,
+            {"query": "餐厅", "city": "北京", "anchor": "故宫"},
+            TEST_VISITOR_ID,
+        )
+
+        poi_tool.assert_called_once_with(
+            query="餐厅",
+            city="北京",
+            anchor="故宫",
+        )
+
+    def test_poi_missing_query_is_rejected(self):
+        with self.assertRaises(service.ToolDispatchError) as caught:
+            service.execute_tool_call(
+                service.POI_TOOL_NAME,
+                {"city": "郑州"},
+                TEST_VISITOR_ID,
+            )
+        self.assertEqual(caught.exception.status, "invalid_tool_arguments")
+
+    def test_poi_missing_city_is_rejected(self):
+        with self.assertRaises(service.ToolDispatchError) as caught:
+            service.execute_tool_call(
+                service.POI_TOOL_NAME,
+                {"query": "咖啡店"},
+                TEST_VISITOR_ID,
+            )
+        self.assertEqual(caught.exception.status, "invalid_tool_arguments")
+
+    @patch.object(service, "search_poi")
+    def test_poi_unknown_or_server_fields_are_rejected(self, poi_tool):
+        forbidden_arguments = (
+            {"query": "餐厅", "city": "北京", "radius": 3000},
+            {"query": "餐厅", "city": "北京", "visitor_id": OTHER_VISITOR_ID},
+            {"query": "餐厅", "city": "北京", "provider": "amap"},
+        )
+        for arguments in forbidden_arguments:
+            with self.subTest(arguments=arguments):
+                with self.assertRaises(service.ToolDispatchError) as caught:
+                    service.execute_tool_call(
+                        service.POI_TOOL_NAME,
+                        arguments,
+                        TEST_VISITOR_ID,
+                    )
+                self.assertEqual(caught.exception.status, "invalid_tool_arguments")
+        poi_tool.assert_not_called()
+
+    @patch.object(service, "search_poi", return_value=poi_status())
+    def test_poi_agent_turn_uses_temporary_tool_result_and_no_sources(self, poi_tool):
+        original_messages = copy.deepcopy(self.messages)
+        client = make_client(
+            response_with_tool_calls(
+                make_tool_call(
+                    '{"query":"餐厅","city":"北京","anchor":"故宫"}',
+                    name=service.POI_TOOL_NAME,
+                )
+            ),
+            response_with_content("故宫附近可以考虑景运门故宫餐厅。"),
+        )
+        with patch.object(service, "_get_chat_client", return_value=client):
+            result = service.run_agent_turn(
+                TEST_VISITOR_ID,
+                "北京故宫附近有什么餐厅？",
+                self.messages,
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["mode"], "tool")
+        self.assertEqual(result["tool_name"], service.POI_TOOL_NAME)
+        self.assertEqual(result["sources"], [])
+        poi_tool.assert_called_once_with(query="餐厅", city="北京", anchor="故宫")
+        self.assertEqual(self.messages, original_messages)
+
+        first_call, second_call = client.chat.completions.create.call_args_list
+        self.assertEqual(first_call.kwargs["tool_choice"], "auto")
+        self.assertFalse(first_call.kwargs["parallel_tool_calls"])
+        self.assertEqual(second_call.kwargs["tool_choice"], "none")
+        tool_message = next(
+            message
+            for message in second_call.kwargs["messages"]
+            if message.get("role") == "tool"
+        )
+        self.assertEqual(json.loads(tool_message["content"]), poi_status())
+        self.assertFalse(any(message.get("role") == "tool" for message in self.messages))
+
+    @patch.object(service, "search_poi", side_effect=RuntimeError("secret key and path"))
+    def test_poi_tool_exception_is_safely_returned(self, poi_tool):
+        client = make_client(
+            response_with_tool_calls(
+                make_tool_call(
+                    '{"query":"咖啡店","city":"郑州"}',
+                    name=service.POI_TOOL_NAME,
+                )
+            )
+        )
+        with patch.object(service, "_get_chat_client", return_value=client):
+            result = service.run_agent_turn(
+                TEST_VISITOR_ID,
+                "郑州有什么咖啡店？",
+                self.messages,
+            )
+
+        self.assertEqual(result["status"], "tool_execution_failed")
+        self.assertNotIn("secret", str(result))
+        poi_tool.assert_called_once()
+
+    def test_poi_argument_schema_declares_required_and_optional_fields(self):
+        schema = service.TOOL_ARGUMENT_SCHEMAS[service.POI_TOOL_NAME]
+        self.assertEqual(schema["allowed_fields"], {"query", "city", "anchor"})
+        self.assertEqual(schema["required_fields"], {"query", "city"})
+        self.assertEqual(schema["optional_fields"], {"anchor"})
 
     @patch.object(service, "knowledge_base_search")
     def test_first_model_failure_is_sanitized(self, search_tool):

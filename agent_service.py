@@ -33,7 +33,9 @@ SUPPORTED_TOOL_NAMES = {
     WEATHER_TOOL_NAME,
     POI_TOOL_NAME,
 }
-MAX_TOOL_CALLS_PER_TURN = 1
+MAX_TOOL_STEPS = 3
+# Each individual model response may request at most one serial Tool Call.
+MAX_TOOL_CALLS_PER_RESPONSE = 1
 MAX_POI_DISPLAY_ITEMS = 5
 POI_DISPLAY_ITEM_FIELDS = {
     "rank",
@@ -614,12 +616,174 @@ def _create_completion(client: Ark, messages: list[dict], tool_choice: Any) -> A
     )
 
 
+def _canonical_tool_call_key(
+    tool_name: str,
+    arguments: Mapping[str, str],
+) -> tuple[str, str]:
+    """Return a stable identity for one validated Tool Call."""
+
+    return (
+        tool_name,
+        json.dumps(
+            dict(arguments),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+    )
+
+
+def _safe_tool_failure() -> dict[str, Any]:
+    """Hide unexpected tool/provider errors from the model and caller."""
+
+    return {
+        "ok": False,
+        "status": "temporarily_unavailable",
+        "message": "相关服务暂时不可用。",
+    }
+
+
+def _duplicate_tool_result() -> dict[str, Any]:
+    return {
+        "ok": False,
+        "status": "duplicate_tool_call",
+        "message": "该工具请求本轮已经执行过，请基于已有结果继续回答。",
+    }
+
+
+def _knowledge_base_already_searched_result() -> dict[str, Any]:
+    return {
+        "ok": False,
+        "status": "already_searched",
+        "message": (
+            "本轮已经执行过知识库检索，请基于已有知识库结果继续回答"
+            "或使用其他工具。"
+        ),
+        "results": [],
+    }
+
+
+def _merge_sources(
+    accumulated_sources: list[dict[str, Any]],
+    tool_result: Mapping[str, Any],
+) -> None:
+    """Append safe KB sources while preserving first-seen order."""
+
+    existing_keys = {
+        (
+            source.get("source_file"),
+            source.get("locator_type") or "page",
+            source.get("locator_value")
+            if source.get("locator_value") not in (None, "")
+            else source.get("page_number"),
+        )
+        for source in accumulated_sources
+    }
+    for source in _deduplicated_sources(tool_result):
+        key = (
+            source.get("source_file"),
+            source.get("locator_type") or "page",
+            source.get("locator_value")
+            if source.get("locator_value") not in (None, "")
+            else source.get("page_number"),
+        )
+        if key not in existing_keys:
+            existing_keys.add(key)
+            accumulated_sources.append(source)
+
+
+def _tool_result_succeeded(tool_result: Mapping[str, Any]) -> bool:
+    return bool(tool_result.get("ok")) and tool_result.get("status") in {
+        "results",
+        "success",
+    }
+
+
+def _model_call_error_status(call_number: int, *, final: bool = False) -> str:
+    if call_number == 1:
+        return "first_model_call_failed"
+    if call_number == 2:
+        return "second_model_call_failed"
+    return "final_model_call_failed" if final else "model_call_failed"
+
+
+def _final_agent_result(
+    message: Any,
+    *,
+    force_knowledge_base: bool,
+    tool_outcomes: Sequence[tuple[str, Mapping[str, Any]]],
+    accumulated_sources: list[dict[str, Any]],
+    display_data: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Build the compatible public result from temporary workflow state."""
+
+    answer = getattr(message, "content", None)
+    if not isinstance(answer, str) or not answer.strip():
+        return _error("empty_model_response")
+
+    has_success = any(
+        _tool_result_succeeded(tool_result)
+        for _, tool_result in tool_outcomes
+    )
+    deterministic_answer: str | None = None
+    if not has_success and force_knowledge_base:
+        first_kb_result = next(
+            (
+                tool_result
+                for tool_name, tool_result in tool_outcomes
+                if tool_name == KNOWLEDGE_BASE_TOOL_NAME
+            ),
+            None,
+        )
+        if first_kb_result is not None:
+            deterministic_answer = _forced_status_answer(
+                first_kb_result.get("status")
+            )
+    if not has_success and deterministic_answer is None:
+        last_weather_result = next(
+            (
+                tool_result
+                for tool_name, tool_result in reversed(tool_outcomes)
+                if tool_name == WEATHER_TOOL_NAME
+            ),
+            None,
+        )
+        if last_weather_result is not None:
+            deterministic_answer = _weather_status_answer(
+                last_weather_result.get("status")
+            )
+
+    answer = deterministic_answer or _remove_trailing_source_section(answer)
+    if not answer:
+        return _error("empty_model_response")
+
+    if not tool_outcomes:
+        return {
+            "ok": True,
+            "mode": "direct",
+            "answer": answer,
+            "sources": [],
+            "display_data": None,
+        }
+
+    last_tool_name, last_tool_result = tool_outcomes[-1]
+    return {
+        "ok": True,
+        "mode": "tool",
+        "answer": answer,
+        "sources": accumulated_sources,
+        "tool_status": last_tool_result.get("status"),
+        "tool_name": last_tool_name,
+        "display_data": display_data,
+    }
+
+
 def run_agent_turn(
     visitor_id: str,
     user_question: str,
     chat_messages: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any]:
-    """Run one bounded agent turn: LLM, optional tool, then final LLM."""
+    """Run one bounded agent turn with up to three serial Tool Calls."""
 
     if not isinstance(user_question, str) or not user_question.strip():
         return _error("invalid_request", "用户问题不能为空。")
@@ -651,127 +815,205 @@ def run_agent_turn(
             "sources": [],
             "display_data": None,
         }
-    api_messages = _build_api_messages(chat_messages, question)
+    working_messages = _build_api_messages(chat_messages, question)
+    if force_knowledge_base:
+        initial_tool_choice = FORCED_KNOWLEDGE_BASE_TOOL_CHOICE
+        forced_tool_name = KNOWLEDGE_BASE_TOOL_NAME
+    elif force_weather:
+        initial_tool_choice = FORCED_WEATHER_TOOL_CHOICE
+        forced_tool_name = WEATHER_TOOL_NAME
+    else:
+        initial_tool_choice = "auto"
+        forced_tool_name = None
 
     try:
         client = _get_chat_client()
-        if force_knowledge_base:
-            first_tool_choice = FORCED_KNOWLEDGE_BASE_TOOL_CHOICE
-            forced_tool_name = KNOWLEDGE_BASE_TOOL_NAME
-        elif force_weather:
-            first_tool_choice = FORCED_WEATHER_TOOL_CHOICE
-            forced_tool_name = WEATHER_TOOL_NAME
-        else:
-            first_tool_choice = "auto"
-            forced_tool_name = None
-        first_response = _create_completion(client, api_messages, first_tool_choice)
-        first_message = _first_message(first_response)
     except Exception:
         return _error("first_model_call_failed")
 
-    calls = _tool_calls(first_message)
-    if not calls:
-        if forced_tool_name is not None:
-            return _error(
-                "forced_tool_not_called",
-                "所需工具未能执行，请稍后重试。",
+    executed_call_keys: set[tuple[str, str]] = set()
+    executed_tool_names: list[str] = []
+    accumulated_sources: list[dict[str, Any]] = []
+    last_successful_poi_display_data: dict[str, Any] | None = None
+    tool_outcomes: list[tuple[str, Mapping[str, Any]]] = []
+    model_call_count = 0
+    force_final = False
+
+    # Reserve the fourth model call for a forced final response. A denied
+    # duplicate or second KB request consumes a decision call, but not an
+    # actual Tool execution step.
+    while (
+        len(executed_tool_names) < MAX_TOOL_STEPS
+        and model_call_count < MAX_TOOL_STEPS
+        and not force_final
+    ):
+        tool_choice = initial_tool_choice if model_call_count == 0 else "auto"
+        call_number = model_call_count + 1
+        try:
+            response = _create_completion(
+                client,
+                working_messages,
+                tool_choice,
             )
-        answer = getattr(first_message, "content", None)
-        if not isinstance(answer, str) or not answer.strip():
-            return _error("empty_model_response")
-        return {
-            "ok": True,
-            "mode": "direct",
-            "answer": answer,
-            "sources": [],
-            "display_data": None,
-        }
+            message = _first_message(response)
+        except Exception:
+            return _error(_model_call_error_status(call_number))
+        model_call_count = call_number
 
-    if len(calls) > MAX_TOOL_CALLS_PER_TURN:
-        return _error(
-            "multiple_tool_calls",
-            "本轮请求包含过多工具调用，请重新提问。",
+        calls = _tool_calls(message)
+        if not calls:
+            if model_call_count == 1 and forced_tool_name is not None:
+                return _error(
+                    "forced_tool_not_called",
+                    "所需工具未能执行，请稍后重试。",
+                )
+            return _final_agent_result(
+                message,
+                force_knowledge_base=force_knowledge_base,
+                tool_outcomes=tool_outcomes,
+                accumulated_sources=accumulated_sources,
+                display_data=last_successful_poi_display_data,
+            )
+
+        if len(calls) > MAX_TOOL_CALLS_PER_RESPONSE:
+            return _error(
+                "multiple_tool_calls",
+                "本轮请求包含过多工具调用，请重新提问。",
+            )
+
+        tool_call = calls[0]
+        tool_name = getattr(
+            getattr(tool_call, "function", None),
+            "name",
+            None,
+        )
+        if tool_name not in SUPPORTED_TOOL_NAMES:
+            return _error("unknown_tool", "模型请求了不支持的工具。")
+        if (
+            model_call_count == 1
+            and forced_tool_name is not None
+            and tool_name != forced_tool_name
+        ):
+            return _error(
+                "forced_tool_mismatch",
+                "模型未能调用正确的工具，请稍后重试。",
+            )
+
+        try:
+            parsed_arguments = _parse_tool_arguments(
+                tool_call.function.arguments,
+                tool_name,
+            )
+        except ToolDispatchError as exc:
+            return _error(exc.status, exc.message)
+
+        call_key = _canonical_tool_call_key(tool_name, parsed_arguments)
+        if call_key in executed_call_keys:
+            duplicate_result = _duplicate_tool_result()
+            working_messages.append(
+                _assistant_tool_call_message(message, tool_call)
+            )
+            working_messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": json.dumps(
+                        duplicate_result,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                }
+            )
+            force_final = True
+            break
+
+        if (
+            tool_name == KNOWLEDGE_BASE_TOOL_NAME
+            and KNOWLEDGE_BASE_TOOL_NAME in executed_tool_names
+        ):
+            already_searched_result = _knowledge_base_already_searched_result()
+            working_messages.append(
+                _assistant_tool_call_message(message, tool_call)
+            )
+            working_messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": json.dumps(
+                        already_searched_result,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                }
+            )
+            continue
+
+        executed_call_keys.add(call_key)
+        try:
+            tool_result = execute_tool_call(
+                tool_name=tool_name,
+                arguments=parsed_arguments,
+                visitor_id=visitor_id,
+            )
+            if not isinstance(tool_result, Mapping):
+                tool_result = _safe_tool_failure()
+        except Exception:
+            tool_result = _safe_tool_failure()
+
+        try:
+            serialized_tool_result = json.dumps(
+                tool_result,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        except (TypeError, ValueError):
+            tool_result = _safe_tool_failure()
+            serialized_tool_result = json.dumps(
+                tool_result,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+
+        executed_tool_names.append(tool_name)
+        tool_outcomes.append((tool_name, tool_result))
+        working_messages.append(_assistant_tool_call_message(message, tool_call))
+        working_messages.append(
+            {
+                "role": "tool",
+                "tool_call_id": tool_call.id,
+                "content": serialized_tool_result,
+            }
         )
 
-    tool_call = calls[0]
-    tool_name = getattr(getattr(tool_call, "function", None), "name", None)
-    if tool_name not in SUPPORTED_TOOL_NAMES:
-        return _error("unknown_tool", "模型请求了不支持的工具。")
-    if forced_tool_name is not None and tool_name != forced_tool_name:
-        return _error(
-            "forced_tool_mismatch",
-            "模型未能调用正确的工具，请稍后重试。",
-        )
+        if tool_name == KNOWLEDGE_BASE_TOOL_NAME:
+            _merge_sources(accumulated_sources, tool_result)
+        elif tool_name == POI_TOOL_NAME:
+            poi_display_data = _build_poi_display_data(tool_result)
+            if poi_display_data is not None:
+                last_successful_poi_display_data = poi_display_data
 
+    # Three decision calls, three actual tools, or a duplicate call all end in
+    # one final model call where further Tool Calls are forbidden.
+    final_call_number = model_call_count + 1
     try:
-        tool_result = execute_tool_call(
-            tool_name=tool_name,
-            arguments=tool_call.function.arguments,
-            visitor_id=visitor_id,
-        )
-        serialized_tool_result = json.dumps(
-            tool_result,
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
-    except ToolDispatchError as exc:
-        return _error(exc.status, exc.message)
+        final_response = _create_completion(client, working_messages, "none")
+        final_message = _first_message(final_response)
     except Exception:
-        return _error("tool_execution_failed", "工具暂时不可用。")
+        return _error(
+            _model_call_error_status(final_call_number, final=True)
+        )
+    model_call_count = final_call_number
 
-    api_messages.append(_assistant_tool_call_message(first_message, tool_call))
-    api_messages.append(
-        {
-            "role": "tool",
-            "tool_call_id": tool_call.id,
-            "content": serialized_tool_result,
-        }
-    )
-
-    try:
-        second_response = _create_completion(client, api_messages, "none")
-        second_message = _first_message(second_response)
-    except Exception:
-        return _error("second_model_call_failed")
-
-    if _tool_calls(second_message):
+    if _tool_calls(final_message):
         return _error(
             "repeated_tool_call",
             "模型重复请求工具，本轮已安全停止。",
         )
 
-    answer = getattr(second_message, "content", None)
-    if not isinstance(answer, str) or not answer.strip():
-        return _error("empty_model_response")
-
-    forced_answer = (
-        _forced_status_answer(tool_result.get("status"))
-        if force_knowledge_base
-        else None
+    return _final_agent_result(
+        final_message,
+        force_knowledge_base=force_knowledge_base,
+        tool_outcomes=tool_outcomes,
+        accumulated_sources=accumulated_sources,
+        display_data=last_successful_poi_display_data,
     )
-    weather_answer = (
-        _weather_status_answer(tool_result.get("status"))
-        if tool_name == WEATHER_TOOL_NAME
-        else None
-    )
-    answer = forced_answer or weather_answer or _remove_trailing_source_section(answer)
-    if not answer:
-        return _error("empty_model_response")
-
-    return {
-        "ok": True,
-        "mode": "tool",
-        "answer": answer,
-        "sources": (
-            _deduplicated_sources(tool_result)
-            if tool_name == KNOWLEDGE_BASE_TOOL_NAME
-            else []
-        ),
-        "tool_status": tool_result.get("status"),
-        "tool_name": tool_name,
-        "display_data": (
-            _build_poi_display_data(tool_result)
-            if tool_name == POI_TOOL_NAME
-            else None
-        ),
-    }

@@ -707,12 +707,13 @@ class AgentServiceTests(unittest.TestCase):
         search_tool.assert_not_called()
 
     @patch.object(service, "knowledge_base_search", return_value=result_status("results"))
-    def test_second_model_tool_call_is_not_executed(self, search_tool):
+    def test_second_knowledge_base_call_is_not_executed(self, search_tool):
         client = make_client(
             response_with_tool_calls(make_tool_call('{"query":"第一次"}')),
             response_with_tool_calls(
                 make_tool_call('{"query":"第二次"}', call_id="call-2")
             ),
+            response_with_content("根据第一次检索结果回答。"),
         )
         with patch.object(service, "_get_chat_client", return_value=client):
             result = service.run_agent_turn(
@@ -721,9 +722,19 @@ class AgentServiceTests(unittest.TestCase):
                 self.messages,
             )
 
-        self.assertEqual(result["status"], "repeated_tool_call")
-        self.assertEqual(client.chat.completions.create.call_count, 2)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["mode"], "tool")
+        self.assertEqual(client.chat.completions.create.call_count, 3)
         search_tool.assert_called_once()
+        final_messages = client.chat.completions.create.call_args_list[2].kwargs[
+            "messages"
+        ]
+        statuses = [
+            json.loads(message["content"])["status"]
+            for message in final_messages
+            if message.get("role") == "tool"
+        ]
+        self.assertIn("already_searched", statuses)
 
     @patch.object(service, "knowledge_base_search", return_value=result_status("results"))
     def test_visitor_id_is_injected_by_server_not_model(self, search_tool):
@@ -880,7 +891,7 @@ class AgentServiceTests(unittest.TestCase):
         first_call, second_call = client.chat.completions.create.call_args_list
         self.assertEqual(first_call.kwargs["tool_choice"], "auto")
         self.assertFalse(first_call.kwargs["parallel_tool_calls"])
-        self.assertEqual(second_call.kwargs["tool_choice"], "none")
+        self.assertEqual(second_call.kwargs["tool_choice"], "auto")
         tool_message = next(
             message
             for message in second_call.kwargs["messages"]
@@ -1173,7 +1184,8 @@ class AgentServiceTests(unittest.TestCase):
                     '{"query":"咖啡店","city":"郑州"}',
                     name=service.POI_TOOL_NAME,
                 )
-            )
+            ),
+            response_with_content("地点搜索服务暂时不可用。"),
         )
         with patch.object(service, "_get_chat_client", return_value=client):
             result = service.run_agent_turn(
@@ -1182,7 +1194,9 @@ class AgentServiceTests(unittest.TestCase):
                 self.messages,
             )
 
-        self.assertEqual(result["status"], "tool_execution_failed")
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["tool_status"], "temporarily_unavailable")
+        self.assertEqual(result["display_data"], None)
         self.assertNotIn("secret", str(result))
         poi_tool.assert_called_once()
 
@@ -1226,6 +1240,557 @@ class AgentServiceTests(unittest.TestCase):
         self.assertEqual(result["status"], "second_model_call_failed")
         self.assertNotIn("secret", str(result))
         search_tool.assert_called_once()
+
+    @patch.object(service, "search_poi", return_value=poi_status())
+    @patch.object(service, "get_weather", return_value=weather_status("success"))
+    def test_weather_then_poi_then_final(
+        self,
+        weather_tool,
+        poi_tool,
+    ):
+        client = make_client(
+            response_with_tool_calls(
+                make_tool_call(
+                    '{"location":"郑州"}',
+                    name=service.WEATHER_TOOL_NAME,
+                    call_id="weather-1",
+                )
+            ),
+            response_with_tool_calls(
+                make_tool_call(
+                    '{"query":"咖啡店","city":"郑州"}',
+                    name=service.POI_TOOL_NAME,
+                    call_id="poi-1",
+                )
+            ),
+            response_with_content("郑州天气晴，推荐去咖啡店。"),
+        )
+
+        with patch.object(service, "_get_chat_client", return_value=client):
+            result = service.run_agent_turn(
+                TEST_VISITOR_ID,
+                "郑州今天天气怎么样，适合去哪些咖啡店？",
+                self.messages,
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["mode"], "tool")
+        self.assertEqual(result["tool_name"], service.POI_TOOL_NAME)
+        self.assertIsNotNone(result["display_data"])
+        self.assertEqual(result["sources"], [])
+        self.assertEqual(client.chat.completions.create.call_count, 3)
+        choices = [
+            call.kwargs["tool_choice"]
+            for call in client.chat.completions.create.call_args_list
+        ]
+        self.assertEqual(
+            choices,
+            [service.FORCED_WEATHER_TOOL_CHOICE, "auto", "auto"],
+        )
+        weather_tool.assert_called_once_with(location="郑州")
+        poi_tool.assert_called_once_with(
+            query="咖啡店",
+            city="郑州",
+            anchor=None,
+        )
+
+    @patch.object(service, "get_weather", return_value=weather_status("success"))
+    @patch.object(service, "knowledge_base_search", return_value=result_status("results"))
+    def test_forced_kb_then_weather_preserves_sources(
+        self,
+        search_tool,
+        weather_tool,
+    ):
+        client = make_client(
+            response_with_tool_calls(
+                make_tool_call(
+                    '{"query":"活动安排"}',
+                    call_id="kb-1",
+                )
+            ),
+            response_with_tool_calls(
+                make_tool_call(
+                    '{"location":"北京"}',
+                    name=service.WEATHER_TOOL_NAME,
+                    call_id="weather-1",
+                )
+            ),
+            response_with_content("结合资料和天气给出安排。[来源1]"),
+        )
+
+        with patch.object(service, "_get_chat_client", return_value=client):
+            result = service.run_agent_turn(
+                TEST_VISITOR_ID,
+                "根据我的知识库和北京今天天气帮我安排活动",
+                self.messages,
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["tool_name"], service.WEATHER_TOOL_NAME)
+        self.assertEqual(
+            result["sources"],
+            [{"source_file": "知识库.pdf", "page_number": 2}],
+        )
+        choices = [
+            call.kwargs["tool_choice"]
+            for call in client.chat.completions.create.call_args_list
+        ]
+        self.assertEqual(
+            choices,
+            [service.FORCED_KNOWLEDGE_BASE_TOOL_CHOICE, "auto", "auto"],
+        )
+        search_tool.assert_called_once_with(
+            visitor_id=TEST_VISITOR_ID,
+            query="活动安排",
+        )
+        weather_tool.assert_called_once_with(location="北京")
+
+    @patch.object(service, "get_weather", return_value=weather_status("success"))
+    @patch.object(service, "knowledge_base_search", return_value=result_status("results"))
+    def test_second_kb_is_denied_but_later_weather_can_run(
+        self,
+        search_tool,
+        weather_tool,
+    ):
+        client = make_client(
+            response_with_tool_calls(
+                make_tool_call('{"query":"第一次资料"}', call_id="kb-1")
+            ),
+            response_with_tool_calls(
+                make_tool_call('{"query":"第二次资料"}', call_id="kb-2")
+            ),
+            response_with_tool_calls(
+                make_tool_call(
+                    '{"location":"北京"}',
+                    name=service.WEATHER_TOOL_NAME,
+                    call_id="weather-1",
+                )
+            ),
+            response_with_content("使用已有资料和天气回答。[来源1]"),
+        )
+
+        with patch.object(service, "_get_chat_client", return_value=client):
+            result = service.run_agent_turn(
+                TEST_VISITOR_ID,
+                "根据我的知识库和北京天气安排活动",
+                self.messages,
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(client.chat.completions.create.call_count, 4)
+        self.assertEqual(
+            client.chat.completions.create.call_args_list[3].kwargs["tool_choice"],
+            "none",
+        )
+        search_tool.assert_called_once_with(
+            visitor_id=TEST_VISITOR_ID,
+            query="第一次资料",
+        )
+        weather_tool.assert_called_once_with(location="北京")
+        final_messages = client.chat.completions.create.call_args_list[3].kwargs[
+            "messages"
+        ]
+        statuses = [
+            json.loads(message["content"])["status"]
+            for message in final_messages
+            if message.get("role") == "tool"
+        ]
+        self.assertEqual(statuses.count("results"), 1)
+        self.assertEqual(statuses.count("already_searched"), 1)
+        self.assertEqual(result["sources"], [{"source_file": "知识库.pdf", "page_number": 2}])
+
+    @patch.object(service, "search_poi", return_value=poi_status())
+    @patch.object(service, "get_weather", return_value=weather_status("success"))
+    @patch.object(service, "knowledge_base_search", return_value=result_status("results"))
+    def test_three_tools_then_fourth_model_call_is_forced_final(
+        self,
+        search_tool,
+        weather_tool,
+        poi_tool,
+    ):
+        original_messages = copy.deepcopy(self.messages)
+        client = make_client(
+            response_with_tool_calls(
+                make_tool_call('{"query":"北京活动"}', call_id="kb-1")
+            ),
+            response_with_tool_calls(
+                make_tool_call(
+                    '{"location":"北京"}',
+                    name=service.WEATHER_TOOL_NAME,
+                    call_id="weather-1",
+                )
+            ),
+            response_with_tool_calls(
+                make_tool_call(
+                    '{"query":"餐厅","city":"北京"}',
+                    name=service.POI_TOOL_NAME,
+                    call_id="poi-1",
+                )
+            ),
+            response_with_content("综合资料、天气和地点给出建议。[来源1]"),
+        )
+
+        with patch.object(service, "_get_chat_client", return_value=client):
+            result = service.run_agent_turn(
+                TEST_VISITOR_ID,
+                "根据我的知识库和北京天气推荐餐厅",
+                self.messages,
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(client.chat.completions.create.call_count, 4)
+        choices = [
+            call.kwargs["tool_choice"]
+            for call in client.chat.completions.create.call_args_list
+        ]
+        self.assertEqual(
+            choices,
+            [service.FORCED_KNOWLEDGE_BASE_TOOL_CHOICE, "auto", "auto", "none"],
+        )
+        self.assertTrue(
+            all(
+                call.kwargs["parallel_tool_calls"] is False
+                for call in client.chat.completions.create.call_args_list
+            )
+        )
+        self.assertEqual(result["tool_name"], service.POI_TOOL_NAME)
+        self.assertIsNotNone(result["display_data"])
+        self.assertEqual(self.messages, original_messages)
+        self.assertFalse(any(message.get("role") == "tool" for message in self.messages))
+        search_tool.assert_called_once()
+        weather_tool.assert_called_once()
+        poi_tool.assert_called_once()
+
+    @patch.object(service, "search_poi", return_value=poi_status())
+    @patch.object(service, "get_weather", return_value=weather_status("success"))
+    @patch.object(service, "knowledge_base_search")
+    def test_fourth_tool_call_is_never_executed(
+        self,
+        search_tool,
+        weather_tool,
+        poi_tool,
+    ):
+        client = make_client(
+            response_with_tool_calls(
+                make_tool_call(
+                    '{"location":"郑州"}',
+                    name=service.WEATHER_TOOL_NAME,
+                    call_id="weather-1",
+                )
+            ),
+            response_with_tool_calls(
+                make_tool_call(
+                    '{"query":"餐厅","city":"郑州"}',
+                    name=service.POI_TOOL_NAME,
+                    call_id="poi-1",
+                )
+            ),
+            response_with_tool_calls(
+                make_tool_call(
+                    '{"location":"北京"}',
+                    name=service.WEATHER_TOOL_NAME,
+                    call_id="weather-2",
+                )
+            ),
+            response_with_tool_calls(
+                make_tool_call('{"query":"不应执行"}', call_id="kb-4")
+            ),
+        )
+
+        with patch.object(service, "_get_chat_client", return_value=client):
+            result = service.run_agent_turn(
+                TEST_VISITOR_ID,
+                "帮我安排城市行程",
+                self.messages,
+            )
+
+        self.assertEqual(result["status"], "repeated_tool_call")
+        self.assertEqual(client.chat.completions.create.call_count, 4)
+        self.assertEqual(
+            client.chat.completions.create.call_args_list[3].kwargs["tool_choice"],
+            "none",
+        )
+        self.assertEqual(weather_tool.call_count, 2)
+        poi_tool.assert_called_once()
+        search_tool.assert_not_called()
+
+    @patch.object(service, "search_poi", return_value=poi_status())
+    def test_duplicate_tool_call_with_reordered_arguments_runs_once(self, poi_tool):
+        client = make_client(
+            response_with_tool_calls(
+                make_tool_call(
+                    '{"query":"咖啡店","city":"郑州"}',
+                    name=service.POI_TOOL_NAME,
+                    call_id="poi-1",
+                )
+            ),
+            response_with_tool_calls(
+                make_tool_call(
+                    '{"city":"郑州","query":"咖啡店"}',
+                    name=service.POI_TOOL_NAME,
+                    call_id="poi-2",
+                )
+            ),
+            response_with_content("根据已有地点结果回答。"),
+        )
+
+        with patch.object(service, "_get_chat_client", return_value=client):
+            result = service.run_agent_turn(
+                TEST_VISITOR_ID,
+                "郑州咖啡店推荐",
+                self.messages,
+            )
+
+        self.assertTrue(result["ok"])
+        poi_tool.assert_called_once()
+        self.assertEqual(client.chat.completions.create.call_count, 3)
+        self.assertEqual(
+            client.chat.completions.create.call_args_list[2].kwargs["tool_choice"],
+            "none",
+        )
+        final_messages = client.chat.completions.create.call_args_list[2].kwargs[
+            "messages"
+        ]
+        self.assertIn(
+            "duplicate_tool_call",
+            [
+                json.loads(message["content"])["status"]
+                for message in final_messages
+                if message.get("role") == "tool"
+            ],
+        )
+
+    @patch.object(service, "get_weather")
+    def test_same_weather_tool_with_different_arguments_is_allowed(
+        self,
+        weather_tool,
+    ):
+        weather_tool.side_effect = [
+            weather_status("success"),
+            {**weather_status("success"), "location": "北京"},
+        ]
+        client = make_client(
+            response_with_tool_calls(
+                make_tool_call(
+                    '{"location":"郑州"}',
+                    name=service.WEATHER_TOOL_NAME,
+                    call_id="weather-1",
+                )
+            ),
+            response_with_tool_calls(
+                make_tool_call(
+                    '{"location":"北京"}',
+                    name=service.WEATHER_TOOL_NAME,
+                    call_id="weather-2",
+                )
+            ),
+            response_with_content("两个城市当前都是晴天。"),
+        )
+
+        with patch.object(service, "_get_chat_client", return_value=client):
+            result = service.run_agent_turn(
+                TEST_VISITOR_ID,
+                "比较郑州和北京的天气",
+                self.messages,
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(weather_tool.call_count, 2)
+        self.assertEqual(result["tool_name"], service.WEATHER_TOOL_NAME)
+
+    @patch.object(service, "search_poi")
+    def test_same_poi_tool_with_different_arguments_is_allowed(self, poi_tool):
+        second_result = copy.deepcopy(poi_status())
+        second_result.update({"query": "咖啡店", "city": "上海", "anchor": None})
+        poi_tool.side_effect = [poi_status(), second_result]
+        client = make_client(
+            response_with_tool_calls(
+                make_tool_call(
+                    '{"query":"餐厅","city":"北京"}',
+                    name=service.POI_TOOL_NAME,
+                    call_id="poi-1",
+                )
+            ),
+            response_with_tool_calls(
+                make_tool_call(
+                    '{"query":"咖啡店","city":"上海"}',
+                    name=service.POI_TOOL_NAME,
+                    call_id="poi-2",
+                )
+            ),
+            response_with_content("已比较两个城市的地点。"),
+        )
+
+        with patch.object(service, "_get_chat_client", return_value=client):
+            result = service.run_agent_turn(
+                TEST_VISITOR_ID,
+                "比较北京餐厅和上海咖啡店",
+                self.messages,
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(poi_tool.call_count, 2)
+        self.assertEqual(result["display_data"]["city"], "上海")
+
+    @patch.object(service, "search_poi", return_value=poi_status())
+    @patch.object(service, "get_weather", side_effect=RuntimeError("secret key/path"))
+    def test_unexpected_tool_exception_is_safe_and_next_tool_runs(
+        self,
+        weather_tool,
+        poi_tool,
+    ):
+        client = make_client(
+            response_with_tool_calls(
+                make_tool_call(
+                    '{"location":"郑州"}',
+                    name=service.WEATHER_TOOL_NAME,
+                    call_id="weather-1",
+                )
+            ),
+            response_with_tool_calls(
+                make_tool_call(
+                    '{"query":"餐厅","city":"郑州"}',
+                    name=service.POI_TOOL_NAME,
+                    call_id="poi-1",
+                )
+            ),
+            response_with_content("天气不可用，但仍找到了餐厅。"),
+        )
+
+        with patch.object(service, "_get_chat_client", return_value=client):
+            result = service.run_agent_turn(
+                TEST_VISITOR_ID,
+                "帮我查询天气和餐厅",
+                self.messages,
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["tool_name"], service.POI_TOOL_NAME)
+        self.assertIsNotNone(result["display_data"])
+        self.assertNotIn("secret", str(result))
+        third_messages = client.chat.completions.create.call_args_list[2].kwargs[
+            "messages"
+        ]
+        serialized_messages = json.dumps(third_messages, ensure_ascii=False)
+        self.assertIn("相关服务暂时不可用", serialized_messages)
+        self.assertNotIn("secret", serialized_messages)
+        weather_tool.assert_called_once()
+        poi_tool.assert_called_once()
+
+    @patch.object(service, "search_poi", return_value=poi_status())
+    @patch.object(
+        service,
+        "get_weather",
+        return_value=weather_status("temporarily_unavailable"),
+    )
+    def test_structured_tool_failure_does_not_stop_next_tool(
+        self,
+        weather_tool,
+        poi_tool,
+    ):
+        client = make_client(
+            response_with_tool_calls(
+                make_tool_call(
+                    '{"location":"郑州"}',
+                    name=service.WEATHER_TOOL_NAME,
+                    call_id="weather-1",
+                )
+            ),
+            response_with_tool_calls(
+                make_tool_call(
+                    '{"query":"餐厅","city":"郑州"}',
+                    name=service.POI_TOOL_NAME,
+                    call_id="poi-1",
+                )
+            ),
+            response_with_content("天气暂不可用，但找到了餐厅。"),
+        )
+
+        with patch.object(service, "_get_chat_client", return_value=client):
+            result = service.run_agent_turn(
+                TEST_VISITOR_ID,
+                "查询郑州天气和餐厅",
+                self.messages,
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["tool_name"], service.POI_TOOL_NAME)
+        self.assertEqual(result["answer"], "天气暂不可用，但找到了餐厅。")
+        self.assertIsNotNone(result["display_data"])
+        weather_tool.assert_called_once()
+        poi_tool.assert_called_once()
+
+    @patch.object(service, "get_weather", return_value=weather_status("success"))
+    @patch.object(service, "search_poi", return_value=poi_status())
+    def test_poi_display_data_survives_later_weather(
+        self,
+        poi_tool,
+        weather_tool,
+    ):
+        client = make_client(
+            response_with_tool_calls(
+                make_tool_call(
+                    '{"query":"餐厅","city":"北京"}',
+                    name=service.POI_TOOL_NAME,
+                    call_id="poi-1",
+                )
+            ),
+            response_with_tool_calls(
+                make_tool_call(
+                    '{"location":"北京"}',
+                    name=service.WEATHER_TOOL_NAME,
+                    call_id="weather-1",
+                )
+            ),
+            response_with_content("推荐餐厅并附上天气建议。"),
+        )
+
+        with patch.object(service, "_get_chat_client", return_value=client):
+            result = service.run_agent_turn(
+                TEST_VISITOR_ID,
+                "北京餐厅和天气建议",
+                self.messages,
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["tool_name"], service.WEATHER_TOOL_NAME)
+        self.assertEqual(result["display_data"]["type"], "poi_results")
+
+    @patch.object(service, "search_poi")
+    def test_failed_later_poi_does_not_clear_successful_display_data(self, poi_tool):
+        poi_tool.side_effect = [
+            poi_status(),
+            poi_status("temporarily_unavailable"),
+        ]
+        client = make_client(
+            response_with_tool_calls(
+                make_tool_call(
+                    '{"query":"餐厅","city":"北京"}',
+                    name=service.POI_TOOL_NAME,
+                    call_id="poi-1",
+                )
+            ),
+            response_with_tool_calls(
+                make_tool_call(
+                    '{"query":"咖啡店","city":"上海"}',
+                    name=service.POI_TOOL_NAME,
+                    call_id="poi-2",
+                )
+            ),
+            response_with_content("保留第一组可用地点。"),
+        )
+
+        with patch.object(service, "_get_chat_client", return_value=client):
+            result = service.run_agent_turn(
+                TEST_VISITOR_ID,
+                "比较北京餐厅和上海咖啡店",
+                self.messages,
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["tool_status"], "temporarily_unavailable")
+        self.assertEqual(result["display_data"]["city"], "北京")
+        self.assertEqual(poi_tool.call_count, 2)
 
 
 if __name__ == "__main__":

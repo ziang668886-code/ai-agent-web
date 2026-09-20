@@ -20,8 +20,12 @@ from chat_repository import (
 )
 from visitor_identity import get_or_create_visitor_id
 from agent_service import run_agent_turn
+from document_processor import (
+    DocumentProcessingError,
+    MAX_DOCUMENT_SIZE_BYTES,
+    process_document,
+)
 from embedding_service import EmbeddingServiceError, embed_chunks, embed_text
-from pdf_processor import PDFProcessingError, SCANNED_PDF_ERROR, process_pdf
 from rag_service import answer_with_rag
 from vector_store import (
     VectorStoreError,
@@ -40,7 +44,6 @@ client = Ark(api_key=api_key)
 SYSTEM_PROMPT = "你的名字是子昂，你的小名是克里斯蒂亚诺。无论任何时候，当用户问你叫什么、叫什么名字、你是谁时，你都回答：我叫子昂，你也可以叫我克里斯蒂亚诺，很高兴认识你。当用户问你的小名、昵称叫什么时，你必须回答：我的小名叫克里斯蒂亚诺。你需要用清晰、友好、简洁的中文回答用户的问题。不要主动说自己是豆包。"
 CONVERSATION_TITLE_MAX_LENGTH = 18
 MANUAL_TITLE_MAX_LENGTH = 30
-MAX_PDF_SIZE_BYTES = 10 * 1024 * 1024
 RAG_ROUTING_THRESHOLD = 0.35
 RAG_TOP_K = 4
 
@@ -58,37 +61,37 @@ SCENE_CARDS = (
         "dining",
         "今天吃什么",
         "根据城市、预算和口味寻找餐厅",
-        ":material/restaurant:",
+        "🍽️",
     ),
     (
         "coffee",
         "找咖啡店",
         "寻找附近适合休息或约会的咖啡店",
-        ":material/local_cafe:",
+        "☕",
     ),
     (
         "weekend",
         "周末去哪玩",
         "发现城市景点和休闲活动",
-        ":material/map:",
+        "🗺️",
     ),
     (
         "weather",
         "天气规划",
         "结合实时天气安排今天的活动",
-        ":material/weather_partly_cloudy:",
+        "☁️",
     ),
     (
         "nearby",
         "附近推荐",
         "根据城市和地标寻找附近地点",
-        ":material/near_me:",
+        "📍",
     ),
     (
         "knowledge",
         "我的资料",
         "从个人知识库获取信息",
-        ":material/folder_open:",
+        "📁",
     ),
 )
 
@@ -112,9 +115,9 @@ def apply_product_styles():
             --city-surface: #ffffff;
         }
         .stApp { background: #f7f8fa; color: var(--city-ink); }
-        .stMainBlockContainer {
+        [data-testid="stMainBlockContainer"] {
             max-width: 1120px;
-            padding-top: 2.25rem;
+            padding-top: 1.5rem;
             padding-bottom: 4rem;
         }
         section[data-testid="stSidebar"] {
@@ -139,11 +142,12 @@ def apply_product_styles():
             padding: 0.35rem 0.75rem;
         }
         .city-hero {
-            padding: clamp(1.75rem, 5vw, 3.75rem);
+            padding: clamp(1.5rem, 3.5vw, 2.75rem);
             border: 1px solid var(--city-border);
             border-radius: 24px;
             background: linear-gradient(145deg, #ffffff 0%, #f3f7ff 100%);
             box-shadow: 0 18px 48px rgba(37, 99, 235, 0.08);
+            margin-top: 0;
             margin-bottom: 1.5rem;
         }
         .city-hero h1 {
@@ -162,9 +166,42 @@ def apply_product_styles():
             margin-bottom: 0.65rem;
         }
         .city-section-copy { color: var(--city-muted); margin-top: -0.5rem; }
+        .city-card-copy {
+            min-height: 6.75rem;
+        }
+        .city-card-title {
+            display: flex;
+            align-items: center;
+            gap: 0.65rem;
+            min-height: 2rem;
+            margin: 0 0 0.65rem 0;
+            color: var(--city-ink);
+            font-size: 1.18rem;
+            font-weight: 700;
+            line-height: 1.35;
+        }
+        .city-card-icon {
+            display: inline-flex;
+            flex: 0 0 1.75rem;
+            width: 1.75rem;
+            height: 1.75rem;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.35rem;
+            line-height: 1;
+        }
+        .city-card-description {
+            min-height: 2.8rem;
+            margin: 0;
+            color: var(--city-muted);
+            font-size: 0.92rem;
+            line-height: 1.5;
+        }
         @media (max-width: 700px) {
-            .stMainBlockContainer { padding-top: 1.25rem; }
+            [data-testid="stMainBlockContainer"] { padding-top: 1.25rem; }
             .city-hero { padding: 1.5rem; border-radius: 18px; }
+            .city-card-copy { min-height: auto; }
+            .city-card-description { min-height: auto; }
         }
         </style>
         """,
@@ -579,7 +616,7 @@ def render_history():
 
 
 def render_knowledge_base():
-    """Render the existing PDF knowledge-base workflow as a product page."""
+    """Render the multi-format in-memory knowledge-base upload workflow."""
     st.title("我的知识库")
     st.caption("把个人资料添加到 AI 助手，后续可以基于这些资料回答问题。")
 
@@ -596,33 +633,34 @@ def render_knowledge_base():
 
     with st.container(border=True):
         st.subheader("添加资料")
-        st.caption("当前支持 PDF，后续将支持更多文档类型。")
-        uploaded_pdf = st.file_uploader(
-            "选择 PDF 文件",
-            type=["pdf"],
+        st.caption("支持 PDF、Word、TXT、Markdown。")
+        uploaded_document = st.file_uploader(
+            "选择资料文件",
+            type=["pdf", "docx", "txt", "md"],
             accept_multiple_files=False,
-            key="knowledge_base_pdf_uploader",
+            key="knowledge_base_document_uploader",
         )
-        st.caption("仅支持可以复制文字的 PDF，暂不支持纯扫描件；单个文件最大 10MB。")
+        st.caption("PDF 需包含可复制文字，TXT 和 Markdown 需使用 UTF-8 编码；单个文件最大 10MB。")
 
-        pdf_too_large = bool(
-            uploaded_pdf and uploaded_pdf.size > MAX_PDF_SIZE_BYTES
+        document_too_large = bool(
+            uploaded_document
+            and uploaded_document.size > MAX_DOCUMENT_SIZE_BYTES
         )
-        if pdf_too_large:
-            st.error("PDF 文件不能超过 10MB。")
+        if document_too_large:
+            st.error("文件不能超过 10MB。")
 
         add_to_knowledge_base = st.button(
             "添加到知识库",
-            key="add_pdf_to_knowledge_base",
+            key="add_document_to_knowledge_base",
             type="primary",
             icon=":material/upload_file:",
-            disabled=uploaded_pdf is None or pdf_too_large,
+            disabled=uploaded_document is None or document_too_large,
         )
-        if not add_to_knowledge_base or pdf_too_large:
+        if not add_to_knowledge_base or document_too_large:
             return
 
-        pdf_bytes = uploaded_pdf.getvalue()
-        document_id = hashlib.sha256(pdf_bytes).hexdigest()
+        file_bytes = uploaded_document.getvalue()
+        document_id = hashlib.sha256(file_bytes).hexdigest()
         visitor_id = st.session_state.visitor_id
 
         try:
@@ -634,20 +672,21 @@ def render_knowledge_base():
             return
 
         try:
-            pdf_result = process_pdf(pdf_bytes, source_file=uploaded_pdf.name)
-        except PDFProcessingError as exc:
-            if str(exc) == SCANNED_PDF_ERROR:
-                st.error(SCANNED_PDF_ERROR)
-            else:
-                st.error("PDF 解析失败，请确认文件完整且包含可复制文字。")
+            document_result = process_document(
+                file_bytes,
+                source_file=uploaded_document.name,
+                content_type=uploaded_document.type,
+            )
+        except DocumentProcessingError as exc:
+            st.error(str(exc))
             return
         except Exception:
-            st.error("PDF 解析失败，请确认文件完整且包含可复制文字。")
+            st.error("文档解析失败，请确认文件完整且格式正确。")
             return
 
         try:
             with st.spinner("正在整理资料并建立知识库…"):
-                embeddings = embed_chunks(pdf_result["chunks"])
+                embeddings = embed_chunks(document_result["chunks"])
         except (EmbeddingServiceError, ValueError):
             st.error("资料处理暂时失败，请稍后重试。")
             return
@@ -656,7 +695,7 @@ def render_knowledge_base():
             return
 
         try:
-            add_chunks(visitor_id, pdf_result["chunks"], embeddings)
+            add_chunks(visitor_id, document_result["chunks"], embeddings)
         except (VectorStoreError, ValueError):
             st.error("知识库保存失败，请稍后重试。")
             return
@@ -665,9 +704,11 @@ def render_knowledge_base():
             return
 
         st.success("已添加到知识库。", icon=":material/check_circle:")
-        st.write(f"文件：{pdf_result['source_file']}")
-        st.write(f"页数：{pdf_result['total_pages']}")
-        st.write(f"文本片段：{len(pdf_result['chunks'])}")
+        st.write(f"文件：{document_result['source_file']}")
+        st.write(f"类型：{document_result['source_type'].upper()}")
+        if document_result.get("total_pages") is not None:
+            st.write(f"页数：{document_result['total_pages']}")
+        st.write(f"文本片段：{len(document_result['chunks'])}")
 
 
 def initialize_ui_state():
@@ -785,7 +826,7 @@ def render_home_scenario_form(scenario):
             with st.form("home_weather_form"):
                 city = st.text_input("城市", placeholder="例如：郑州")
                 activity = st.text_input("想安排的活动（可选）", placeholder="例如：户外散步")
-                submitted = st.form_submit_button("查看天气建议", type="primary", icon=":material/weather_partly_cloudy:")
+                submitted = st.form_submit_button("查看天气建议", type="primary", icon=":material/cloud:")
             if submitted:
                 if not city.strip():
                     st.error("请填写城市。")
@@ -837,8 +878,8 @@ def render_home():
     with st.form("home_quick_question", border=False):
         with st.container(horizontal=True, vertical_alignment="bottom"):
             quick_question = st.text_input(
-                "输入你的需求",
-                placeholder="例如：帮我找郑州适合约会的咖啡店",
+                "直接告诉 AI 你的需求",
+                placeholder="例如：今晚郑州两个人，人均 100，想吃火锅",
                 key="home_quick_question_input",
             )
             submitted = st.form_submit_button(
@@ -861,8 +902,18 @@ def render_home():
             SCENE_CARDS[row_start : row_start + 3],
         ):
             with column.container(border=True, height="stretch"):
-                st.markdown(f"### {icon} {title}")
-                st.caption(description)
+                st.markdown(
+                    f"""
+                    <div class="city-card-copy">
+                      <div class="city-card-title">
+                        <span class="city-card-icon" aria-hidden="true">{icon}</span>
+                        <span>{title}</span>
+                      </div>
+                      <p class="city-card-description">{description}</p>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
                 if st.button(
                     "开始",
                     key=f"home_scene_{scenario}",
@@ -949,21 +1000,50 @@ def get_rag_retrieval_results(question):
     return None, False
 
 
+def format_knowledge_source(source):
+    """Format a real page or non-page locator without exposing internals."""
+    source_file = str(source.get("source_file") or "未知文件")
+    source_type = source.get("source_type")
+    locator_type = source.get("locator_type")
+    locator_value = source.get("locator_value")
+    page_number = source.get("page_number")
+
+    if (
+        source_type == "pdf"
+        or locator_type == "page"
+        or (
+            source_type is None
+            and isinstance(page_number, int)
+            and not isinstance(page_number, bool)
+            and page_number > 0
+        )
+    ):
+        page = page_number or locator_value
+        return f"{source_file} · 第{page}页" if page else source_file
+
+    if locator_type == "paragraph" and locator_value:
+        value = str(locator_value)
+        label = f"第{value}段" if value.isdigit() else value
+        return f"{source_file} · {label}"
+    if locator_type == "chunk" and locator_value:
+        return f"{source_file} · Chunk {locator_value}"
+    if locator_type == "section" and locator_value:
+        return f"{source_file} · {locator_value}"
+    return source_file
+
+
 def add_sources_to_answer(answer, sources):
-    """Append deduplicated, display-safe source labels to a RAG answer."""
+    """Append deduplicated, display-safe document source labels."""
     source_lines = []
     seen_sources = set()
     for source in sources:
-        source_key = (
-            source["source_file"],
-            source["page_number"],
-        )
-        if source_key in seen_sources:
+        if not isinstance(source, dict):
             continue
-        seen_sources.add(source_key)
-        source_lines.append(
-            f"- {source['source_file']} · 第{source['page_number']}页"
-        )
+        label = format_knowledge_source(source)
+        if label in seen_sources:
+            continue
+        seen_sources.add(label)
+        source_lines.append(f"- {label}")
 
     if not source_lines:
         return answer

@@ -23,6 +23,7 @@ REQUIRED_CHUNK_FIELDS = {
     "page_number",
     "chunk_index",
 }
+SUPPORTED_SOURCE_TYPES = {"pdf", "docx", "txt", "md"}
 
 
 class VectorStoreError(RuntimeError):
@@ -69,10 +70,59 @@ def _normalize_rows(embeddings: np.ndarray) -> np.ndarray:
     return np.asarray(array / norms, dtype=np.float32)
 
 
+def _with_compatible_metadata(data: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    """Fill metadata absent from legacy PDF indexes without rewriting them."""
+
+    required_arrays = {
+        "embeddings",
+        "chunk_texts",
+        "document_ids",
+        "chunk_ids",
+        "source_files",
+        "page_numbers",
+        "chunk_indexes",
+    }
+    missing = required_arrays.difference(data)
+    if missing:
+        raise VectorStoreError(
+            f"向量索引缺少必要数据：{', '.join(sorted(missing))}"
+        )
+
+    row_count = len(data["chunk_ids"])
+    for name in required_arrays:
+        if len(data[name]) != row_count:
+            raise VectorStoreError("向量索引字段长度不一致。")
+
+    page_numbers = np.asarray(data["page_numbers"], dtype=np.int32)
+    if "source_types" not in data:
+        data["source_types"] = np.asarray(
+            ["pdf"] * row_count,
+            dtype=np.str_,
+        )
+    if "locator_types" not in data:
+        data["locator_types"] = np.asarray(
+            ["page"] * row_count,
+            dtype=np.str_,
+        )
+    if "locator_values" not in data:
+        data["locator_values"] = np.asarray(
+            [str(page_number) for page_number in page_numbers],
+            dtype=np.str_,
+        )
+
+    for name in ("source_types", "locator_types", "locator_values"):
+        if len(data[name]) != row_count:
+            raise VectorStoreError("向量索引元数据长度不一致。")
+    return data
+
+
 def _load_index(index_path: Path) -> dict[str, np.ndarray]:
     try:
         with np.load(index_path, allow_pickle=False) as data:
-            return {name: data[name].copy() for name in data.files}
+            loaded = {name: data[name].copy() for name in data.files}
+        return _with_compatible_metadata(loaded)
+    except VectorStoreError:
+        raise
     except Exception as exc:
         raise VectorStoreError("向量索引读取失败，文件可能已损坏。") from exc
 
@@ -83,13 +133,46 @@ def _chunk_arrays(chunks: Sequence[Mapping[str, object]]) -> dict[str, np.ndarra
         if missing:
             raise ValueError(f"第 {index} 个 Chunk 缺少字段：{', '.join(sorted(missing))}")
 
+    page_numbers: list[int] = []
+    source_types: list[str] = []
+    locator_types: list[str] = []
+    locator_values: list[str] = []
+    for index, chunk in enumerate(chunks):
+        page_number = chunk.get("page_number")
+        safe_page_number = -1 if page_number is None else int(page_number)
+        source_type = str(
+            chunk.get("source_type")
+            or ("pdf" if safe_page_number >= 0 else "txt")
+        ).lower()
+        if source_type not in SUPPORTED_SOURCE_TYPES:
+            raise ValueError(f"第 {index} 个 Chunk 的 source_type 无效。")
+        locator_type = str(
+            chunk.get("locator_type")
+            or ("page" if source_type == "pdf" else "chunk")
+        )
+        locator_value = chunk.get("locator_value")
+        if locator_value is None:
+            locator_value = (
+                str(safe_page_number)
+                if locator_type == "page" and safe_page_number >= 0
+                else str(int(chunk["chunk_index"]) + 1)
+            )
+
+        page_numbers.append(safe_page_number)
+        source_types.append(source_type)
+        locator_types.append(locator_type)
+        locator_values.append(str(locator_value))
+
     return {
         "chunk_texts": np.asarray([str(c["chunk_text"]) for c in chunks], dtype=np.str_),
         "document_ids": np.asarray([str(c["document_id"]) for c in chunks], dtype=np.str_),
         "chunk_ids": np.asarray([str(c["chunk_id"]) for c in chunks], dtype=np.str_),
         "source_files": np.asarray([Path(str(c["source_file"])).name for c in chunks], dtype=np.str_),
-        "page_numbers": np.asarray([int(c["page_number"]) for c in chunks], dtype=np.int32),
+        "page_numbers": np.asarray(page_numbers, dtype=np.int32),
         "chunk_indexes": np.asarray([int(c["chunk_index"]) for c in chunks], dtype=np.int32),
+        "source_types": np.asarray(source_types, dtype=np.str_),
+        "locator_types": np.asarray(locator_types, dtype=np.str_),
+        "locator_values": np.asarray(locator_values, dtype=np.str_),
     }
 
 
@@ -211,7 +294,14 @@ def search(
             "score": float(scores[index]),
             "chunk_text": str(data["chunk_texts"][index]),
             "source_file": str(data["source_files"][index]),
-            "page_number": int(data["page_numbers"][index]),
+            "page_number": (
+                int(data["page_numbers"][index])
+                if int(data["page_numbers"][index]) >= 0
+                else None
+            ),
+            "source_type": str(data["source_types"][index]),
+            "locator_type": str(data["locator_types"][index]),
+            "locator_value": str(data["locator_values"][index]),
             "document_id": str(data["document_ids"][index]),
             "chunk_id": str(data["chunk_ids"][index]),
         }

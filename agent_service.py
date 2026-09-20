@@ -459,16 +459,24 @@ def _deduplicated_sources(tool_result: Mapping[str, Any]) -> list[dict[str, Any]
     for result in tool_result.get("results", []):
         source_file = str(result.get("source_file", ""))
         page_number = result.get("page_number")
-        key = (source_file, page_number)
+        locator_type = result.get("locator_type")
+        locator_value = result.get("locator_value")
+        key = (
+            source_file,
+            locator_type or "page",
+            locator_value if locator_value not in (None, "") else page_number,
+        )
         if not source_file or key in seen:
             continue
         seen.add(key)
-        sources.append(
-            {
-                "source_file": source_file,
-                "page_number": page_number,
-            }
-        )
+        source = {
+            "source_file": source_file,
+            "page_number": page_number,
+        }
+        for field in ("source_type", "locator_type", "locator_value"):
+            if field in result:
+                source[field] = result.get(field)
+        sources.append(source)
     return sources
 
 

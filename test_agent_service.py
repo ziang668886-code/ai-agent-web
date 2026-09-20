@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import agent_service as service
+import knowledge_base_tool as kb_tool
 
 
 TEST_VISITOR_ID = "11111111-1111-4111-8111-111111111111"
@@ -1048,6 +1049,121 @@ class AgentServiceTests(unittest.TestCase):
                 self.messages,
             )
         self.assertIsNone(result["display_data"])
+
+    def test_document_sources_deduplicate_by_real_locator(self):
+        tool_result = {
+            "status": "results",
+            "results": [
+                {
+                    "source_file": "旅行计划.md",
+                    "source_type": "md",
+                    "page_number": None,
+                    "locator_type": "section",
+                    "locator_value": "交通安排",
+                },
+                {
+                    "source_file": "旅行计划.md",
+                    "source_type": "md",
+                    "page_number": None,
+                    "locator_type": "section",
+                    "locator_value": "交通安排",
+                },
+                {
+                    "source_file": "旅行计划.md",
+                    "source_type": "md",
+                    "page_number": None,
+                    "locator_type": "section",
+                    "locator_value": "餐饮建议",
+                },
+            ],
+        }
+
+        sources = service._deduplicated_sources(tool_result)
+
+        self.assertEqual(len(sources), 2)
+        self.assertEqual(sources[0]["source_type"], "md")
+        self.assertIsNone(sources[0]["page_number"])
+        self.assertEqual(sources[0]["locator_value"], "交通安排")
+
+    def test_low_score_pdf_candidates_never_reach_agent_sources(self):
+        raw_results = [
+            {
+                "score": 0.62,
+                "chunk_text": "城市生活助手测试口令是蓝鲸7392。",
+                "source_file": "测试.docx",
+                "source_type": "docx",
+                "page_number": None,
+                "locator_type": "paragraph",
+                "locator_value": "1",
+                "document_id": "docx-document",
+                "chunk_id": "docx-chunk",
+            },
+            *[
+                {
+                    "score": score,
+                    "chunk_text": f"无关旧 PDF 内容 {index}",
+                    "source_file": f"旧资料{index}.pdf",
+                    "source_type": "pdf",
+                    "page_number": index,
+                    "locator_type": "page",
+                    "locator_value": str(index),
+                    "document_id": f"pdf-document-{index}",
+                    "chunk_id": f"pdf-chunk-{index}",
+                }
+                for index, score in enumerate((0.31, 0.27, 0.19), start=1)
+            ],
+        ]
+        with (
+            patch.object(kb_tool, "has_knowledge_base", return_value=True),
+            patch.object(kb_tool, "embed_text", return_value=[1.0]),
+            patch.object(kb_tool, "search", return_value=raw_results),
+        ):
+            filtered_tool_result = kb_tool.knowledge_base_search(
+                TEST_VISITOR_ID,
+                "城市生活助手测试口令是什么？",
+            )
+
+        self.assertEqual(filtered_tool_result["result_count"], 1)
+        self.assertEqual(
+            [item["source_file"] for item in filtered_tool_result["results"]],
+            ["测试.docx"],
+        )
+        self.assertNotIn("旧资料", json.dumps(filtered_tool_result, ensure_ascii=False))
+
+        client = make_client(
+            response_with_tool_calls(
+                make_tool_call('{"query":"城市生活助手测试口令"}')
+            ),
+            response_with_content("测试口令是蓝鲸7392。"),
+        )
+        with (
+            patch.object(
+                service,
+                "knowledge_base_search",
+                return_value=filtered_tool_result,
+            ),
+            patch.object(service, "_get_chat_client", return_value=client),
+        ):
+            result = service.run_agent_turn(
+                TEST_VISITOR_ID,
+                "根据我的知识库，城市生活助手测试口令是什么？",
+                self.messages,
+            )
+
+        self.assertEqual(result["mode"], "tool")
+        self.assertEqual(
+            result["sources"],
+            [
+                {
+                    "source_file": "测试.docx",
+                    "page_number": None,
+                    "source_type": "docx",
+                    "locator_type": "paragraph",
+                    "locator_value": "1",
+                }
+            ],
+        )
+        self.assertNotIn("旧资料", json.dumps(result, ensure_ascii=False))
 
     @patch.object(service, "search_poi", side_effect=RuntimeError("secret key and path"))
     def test_poi_tool_exception_is_safely_returned(self, poi_tool):

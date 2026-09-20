@@ -73,14 +73,121 @@ class KnowledgeBaseToolTests(unittest.TestCase):
         search.assert_called_once()
         self.assertEqual(search.call_args.kwargs["top_k"], tool.KNOWLEDGE_BASE_TOP_K)
 
-    @patch.object(tool, "search", return_value=[make_result(0.21)])
+    @patch.object(tool, "search")
+    @patch.object(tool, "embed_text", return_value=np.array([1.0], dtype=np.float32))
+    @patch.object(tool, "has_knowledge_base", return_value=True)
+    def test_only_candidates_at_or_above_threshold_are_returned(
+        self,
+        _has_kb,
+        _embed,
+        search,
+    ):
+        search.return_value = [
+            make_result(0.48, 1),
+            make_result(0.41, 2),
+            make_result(0.34, 3),
+            make_result(0.20, 4),
+        ]
+
+        result = tool.knowledge_base_search(TEST_VISITOR_ID, "知识库问题")
+
+        self.assertEqual(result["status"], "results")
+        self.assertEqual(result["result_count"], 2)
+        self.assertEqual(
+            [item["source_file"] for item in result["results"]],
+            ["测试资料1.pdf", "测试资料2.pdf"],
+        )
+
+    @patch.object(tool, "search")
+    @patch.object(tool, "embed_text", return_value=np.array([1.0], dtype=np.float32))
+    @patch.object(tool, "has_knowledge_base", return_value=True)
+    def test_only_top_candidate_can_pass_threshold(self, _has_kb, _embed, search):
+        search.return_value = [
+            make_result(0.48, 1),
+            make_result(0.30, 2),
+            make_result(0.25, 3),
+            make_result(0.10, 4),
+        ]
+
+        result = tool.knowledge_base_search(TEST_VISITOR_ID, "单条证据问题")
+
+        self.assertEqual(result["result_count"], 1)
+        self.assertEqual(result["results"][0]["source_file"], "测试资料1.pdf")
+
+    @patch.object(tool, "search", return_value=[make_result(0.35, 1)])
+    @patch.object(tool, "embed_text", return_value=np.array([1.0], dtype=np.float32))
+    @patch.object(tool, "has_knowledge_base", return_value=True)
+    def test_threshold_boundary_is_inclusive(self, _has_kb, _embed, _search):
+        result = tool.knowledge_base_search(TEST_VISITOR_ID, "边界值问题")
+
+        self.assertEqual(result["status"], "results")
+        self.assertEqual(result["result_count"], 1)
+        self.assertEqual(result["results"][0]["score"], 0.35)
+
+    @patch.object(tool, "search")
+    @patch.object(tool, "embed_text", return_value=np.array([1.0], dtype=np.float32))
+    @patch.object(tool, "has_knowledge_base", return_value=True)
+    def test_filtered_results_receive_continuous_rank_and_citation(
+        self,
+        _has_kb,
+        _embed,
+        search,
+    ):
+        search.return_value = [
+            make_result(0.48, 1),
+            make_result(0.30, 2),
+            make_result(0.42, 3),
+            make_result(0.20, 4),
+        ]
+
+        result = tool.knowledge_base_search(TEST_VISITOR_ID, "重新编号问题")
+
+        self.assertEqual(
+            [item["rank"] for item in result["results"]],
+            [1, 2],
+        )
+        self.assertEqual(
+            [item["citation"] for item in result["results"]],
+            ["来源1", "来源2"],
+        )
+        self.assertEqual(
+            [item["source_file"] for item in result["results"]],
+            ["测试资料1.pdf", "测试资料3.pdf"],
+        )
+
+    @patch.object(
+        tool,
+        "search",
+        return_value=[
+            make_result(0.349, 1),
+            make_result(0.30, 2),
+            make_result(0.20, 3),
+            make_result(0.10, 4),
+        ],
+    )
     @patch.object(tool, "embed_text", return_value=np.array([1.0], dtype=np.float32))
     @patch.object(tool, "has_knowledge_base", return_value=True)
     def test_low_score_returns_no_chunks(self, _has_kb, _embed, _search):
         result = tool.knowledge_base_search(TEST_VISITOR_ID, "无关问题")
 
         self.assertEqual(result["status"], "no_relevant_results")
-        self.assertEqual(result["top_score"], 0.21)
+        self.assertEqual(result["top_score"], 0.349)
+        self.assertEqual(result["results"], [])
+
+    @patch.object(tool, "search")
+    @patch.object(tool, "embed_text", return_value=np.array([1.0], dtype=np.float32))
+    @patch.object(tool, "has_knowledge_base", return_value=True)
+    def test_invalid_scores_are_safely_ignored(self, _has_kb, _embed, search):
+        invalid_values = [None, "0.99", float("nan"), float("inf")]
+        search.return_value = [
+            {**make_result(0.50, index), "score": value}
+            for index, value in enumerate(invalid_values, start=1)
+        ]
+
+        result = tool.knowledge_base_search(TEST_VISITOR_ID, "非法分数")
+
+        self.assertEqual(result["status"], "no_relevant_results")
+        self.assertEqual(result["top_score"], 0.0)
         self.assertEqual(result["results"], [])
 
     @patch.object(tool, "search")
@@ -125,6 +232,44 @@ class KnowledgeBaseToolTests(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, serialized)
         self.assertEqual(result["results"][0]["source_file"], "测试资料1.pdf")
+
+    @patch.object(tool, "search")
+    @patch.object(tool, "embed_text", return_value=np.array([1.0], dtype=np.float32))
+    @patch.object(tool, "has_knowledge_base", return_value=True)
+    def test_non_pdf_locator_is_returned_without_fake_page(self, _has_kb, _embed, search):
+        item = make_result(0.60, 1)
+        item.update(
+            {
+                "source_file": "C:\\private\\旅行计划.md",
+                "source_type": "md",
+                "page_number": None,
+                "locator_type": "section",
+                "locator_value": "交通安排",
+            }
+        )
+        search.return_value = [item]
+
+        result = tool.knowledge_base_search(TEST_VISITOR_ID, "交通如何安排？")
+        source = result["results"][0]
+
+        self.assertEqual(source["source_type"], "md")
+        self.assertIsNone(source["page_number"])
+        self.assertEqual(source["locator_type"], "section")
+        self.assertEqual(source["locator_value"], "交通安排")
+        self.assertNotIn("document_id", source)
+        self.assertNotIn("chunk_id", source)
+
+    @patch.object(tool, "search", return_value=[make_result(0.60, 3)])
+    @patch.object(tool, "embed_text", return_value=np.array([1.0], dtype=np.float32))
+    @patch.object(tool, "has_knowledge_base", return_value=True)
+    def test_legacy_pdf_result_gets_page_locator(self, _has_kb, _embed, _search):
+        result = tool.knowledge_base_search(TEST_VISITOR_ID, "PDF 问题")
+        source = result["results"][0]
+
+        self.assertEqual(source["source_type"], "pdf")
+        self.assertEqual(source["page_number"], 3)
+        self.assertEqual(source["locator_type"], "page")
+        self.assertEqual(source["locator_value"], "3")
 
     def test_model_schema_exposes_only_query(self):
         function_schema = tool.KNOWLEDGE_BASE_SEARCH_TOOL["function"]

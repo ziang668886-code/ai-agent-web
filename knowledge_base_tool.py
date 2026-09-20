@@ -4,6 +4,7 @@ This module only performs retrieval. It does not read browser state, call the
 chat model, persist chat messages, or mutate the knowledge-base index.
 """
 
+import math
 from typing import Any
 
 from embedding_service import embed_text
@@ -26,7 +27,7 @@ KNOWLEDGE_BASE_SEARCH_TOOL = {
     "function": {
         "name": "knowledge_base_search",
         "description": (
-            "Search the current user's uploaded PDF knowledge base when the "
+            "Search the current user's uploaded document knowledge base when the "
             "answer may depend on their documents."
         ),
         "parameters": {
@@ -69,6 +70,49 @@ def _safe_source_file(value: Any) -> str:
     """Return a display-only filename without exposing a local directory."""
 
     return str(value or "未知文件").replace("\\", "/").rsplit("/", 1)[-1]
+
+
+def _safe_score(value: Any) -> float | None:
+    """Return one finite numeric similarity score, otherwise ``None``."""
+
+    if value is None or isinstance(value, (bool, str, bytes)):
+        return None
+    try:
+        score = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return score if math.isfinite(score) else None
+
+
+def _safe_locator(item: dict[str, Any]) -> dict[str, Any]:
+    """Return display-safe source metadata with legacy PDF fallbacks."""
+
+    page_number = item.get("page_number")
+    if not isinstance(page_number, int) or isinstance(page_number, bool) or page_number < 1:
+        page_number = None
+
+    source_type = item.get("source_type")
+    if source_type not in {"pdf", "docx", "txt", "md"}:
+        source_type = "pdf" if page_number is not None else "txt"
+
+    locator_type = item.get("locator_type")
+    if not isinstance(locator_type, str) or not locator_type.strip():
+        locator_type = "page" if source_type == "pdf" else "chunk"
+    else:
+        locator_type = locator_type.strip()
+
+    locator_value = item.get("locator_value")
+    if not isinstance(locator_value, str) or not locator_value.strip():
+        locator_value = str(page_number) if page_number is not None else ""
+    else:
+        locator_value = locator_value.strip()
+
+    return {
+        "source_type": source_type,
+        "page_number": page_number,
+        "locator_type": locator_type,
+        "locator_value": locator_value,
+    }
 
 
 def knowledge_base_search(
@@ -129,8 +173,20 @@ def knowledge_base_search(
     except Exception:
         return _temporarily_unavailable("INDEX_UNAVAILABLE")
 
-    top_score = float(raw_results[0].get("score", 0.0)) if raw_results else 0.0
-    if top_score < KNOWLEDGE_BASE_THRESHOLD:
+    valid_scores: list[float] = []
+    relevant_results: list[tuple[dict[str, Any], float]] = []
+    for item in raw_results:
+        if not isinstance(item, dict):
+            continue
+        score = _safe_score(item.get("score"))
+        if score is None:
+            continue
+        valid_scores.append(score)
+        if score >= KNOWLEDGE_BASE_THRESHOLD:
+            relevant_results.append((item, score))
+
+    top_score = max(valid_scores, default=0.0)
+    if not relevant_results:
         return {
             "ok": True,
             "status": "no_relevant_results",
@@ -140,15 +196,16 @@ def knowledge_base_search(
         }
 
     results = []
-    for rank, item in enumerate(raw_results, start=1):
+    for rank, (item, score) in enumerate(relevant_results, start=1):
+        locator = _safe_locator(item)
         results.append(
             {
                 "citation": f"来源{rank}",
                 "rank": rank,
                 "content": str(item.get("chunk_text", "")),
                 "source_file": _safe_source_file(item.get("source_file")),
-                "page_number": item.get("page_number"),
-                "score": float(item.get("score", 0.0)),
+                **locator,
+                "score": score,
             }
         )
 

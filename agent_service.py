@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import os
 import re
 from collections.abc import Mapping, Sequence
@@ -33,6 +34,21 @@ SUPPORTED_TOOL_NAMES = {
     POI_TOOL_NAME,
 }
 MAX_TOOL_CALLS_PER_TURN = 1
+MAX_POI_DISPLAY_ITEMS = 5
+POI_DISPLAY_ITEM_FIELDS = {
+    "rank",
+    "name",
+    "address",
+    "district",
+    "category",
+    "distance_m",
+    "rating",
+    "cost_per_person",
+    "tags",
+    "opening_hours",
+    "location",
+}
+POI_DISPLAY_LOCATION_FIELDS = {"longitude", "latitude"}
 
 TOOL_ARGUMENT_SCHEMAS = {
     KNOWLEDGE_BASE_TOOL_NAME: {
@@ -456,6 +472,126 @@ def _deduplicated_sources(tool_result: Mapping[str, Any]) -> list[dict[str, Any]
     return sources
 
 
+def _safe_display_number(value: Any) -> int | float | None:
+    """Return a finite non-negative provider number without coercing strings."""
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if not math.isfinite(value) or value < 0:
+        return None
+    return value
+
+
+def _safe_coordinate(value: Any, minimum: float, maximum: float) -> int | float | None:
+    """Return one finite coordinate only when it is inside its valid range."""
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if not math.isfinite(value) or not minimum <= value <= maximum:
+        return None
+    return value
+
+
+def _build_poi_display_data(tool_result: Any) -> dict[str, Any] | None:
+    """Build a UI-only POI payload from an allow-list of safe fields."""
+
+    try:
+        if not isinstance(tool_result, Mapping):
+            return None
+        if tool_result.get("status") != "results":
+            return None
+
+        raw_results = tool_result.get("results")
+        if not isinstance(raw_results, (list, tuple)):
+            return None
+
+        items: list[dict[str, Any]] = []
+        for raw_item in raw_results:
+            if len(items) >= MAX_POI_DISPLAY_ITEMS:
+                break
+            if not isinstance(raw_item, Mapping):
+                continue
+
+            name = raw_item.get("name")
+            if not isinstance(name, str) or not name.strip():
+                continue
+
+            item: dict[str, Any] = {"name": name.strip()}
+            rank = raw_item.get("rank")
+            if isinstance(rank, int) and not isinstance(rank, bool) and rank > 0:
+                item["rank"] = rank
+
+            for field in (
+                "address",
+                "district",
+                "category",
+                "opening_hours",
+            ):
+                value = raw_item.get(field)
+                if isinstance(value, str) and value.strip():
+                    item[field] = value.strip()
+
+            for field in ("distance_m", "rating", "cost_per_person"):
+                value = _safe_display_number(raw_item.get(field))
+                if value is not None:
+                    item[field] = value
+
+            raw_tags = raw_item.get("tags")
+            if isinstance(raw_tags, (list, tuple)):
+                tags = [
+                    tag.strip()
+                    for tag in raw_tags
+                    if isinstance(tag, str) and tag.strip()
+                ]
+                if tags:
+                    item["tags"] = tags
+
+            raw_location = raw_item.get("location")
+            if isinstance(raw_location, Mapping):
+                longitude = _safe_coordinate(
+                    raw_location.get("longitude"),
+                    -180,
+                    180,
+                )
+                latitude = _safe_coordinate(
+                    raw_location.get("latitude"),
+                    -90,
+                    90,
+                )
+                location: dict[str, Any] = {}
+                if longitude is not None:
+                    location["longitude"] = longitude
+                if latitude is not None:
+                    location["latitude"] = latitude
+                if location:
+                    item["location"] = location
+
+            items.append(item)
+
+        if not items:
+            return None
+
+        display_data: dict[str, Any] = {
+            "type": "poi_results",
+            "items": items,
+        }
+        for field in ("query", "city", "search_mode"):
+            value = tool_result.get(field)
+            if isinstance(value, str) and value.strip():
+                display_data[field] = value.strip()
+
+        anchor = tool_result.get("anchor")
+        display_data["anchor"] = (
+            anchor.strip()
+            if isinstance(anchor, str) and anchor.strip()
+            else None
+        )
+        return display_data
+    except Exception:
+        # Display metadata must never interrupt the final natural-language answer.
+        return None
+
+
 def _create_completion(client: Ark, messages: list[dict], tool_choice: Any) -> Any:
     return client.chat.completions.create(
         model=CHAT_MODEL,
@@ -494,6 +630,7 @@ def run_agent_turn(
             "mode": "direct",
             "answer": "当前天气工具暂不支持未来天气预报，请询问当前或今天的实时天气。",
             "sources": [],
+            "display_data": None,
         }
     if (
         not force_knowledge_base
@@ -504,6 +641,7 @@ def run_agent_turn(
             "mode": "direct",
             "answer": "请提供要查询的城市或地区名称。",
             "sources": [],
+            "display_data": None,
         }
     api_messages = _build_api_messages(chat_messages, question)
 
@@ -538,6 +676,7 @@ def run_agent_turn(
             "mode": "direct",
             "answer": answer,
             "sources": [],
+            "display_data": None,
         }
 
     if len(calls) > MAX_TOOL_CALLS_PER_TURN:
@@ -622,4 +761,9 @@ def run_agent_turn(
         ),
         "tool_status": tool_result.get("status"),
         "tool_name": tool_name,
+        "display_data": (
+            _build_poi_display_data(tool_result)
+            if tool_name == POI_TOOL_NAME
+            else None
+        ),
     }

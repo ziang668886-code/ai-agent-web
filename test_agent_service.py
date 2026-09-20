@@ -888,6 +888,167 @@ class AgentServiceTests(unittest.TestCase):
         self.assertEqual(json.loads(tool_message["content"]), poi_status())
         self.assertFalse(any(message.get("role") == "tool" for message in self.messages))
 
+    @patch.object(service, "search_poi", return_value=poi_status())
+    def test_poi_results_create_display_data(self, _poi_tool):
+        client = make_client(
+            response_with_tool_calls(
+                make_tool_call(
+                    '{"query":"餐厅","city":"北京","anchor":"故宫"}',
+                    name=service.POI_TOOL_NAME,
+                )
+            ),
+            response_with_content("推荐回答"),
+        )
+        with patch.object(service, "_get_chat_client", return_value=client):
+            result = service.run_agent_turn(
+                TEST_VISITOR_ID,
+                "北京故宫附近有什么餐厅？",
+                self.messages,
+            )
+
+        display_data = result["display_data"]
+        self.assertEqual(display_data["type"], "poi_results")
+        self.assertEqual(display_data["query"], "餐厅")
+        self.assertEqual(display_data["city"], "北京")
+        self.assertEqual(display_data["search_mode"], "nearby")
+        self.assertEqual(display_data["anchor"], "故宫")
+        self.assertEqual(len(display_data["items"]), 1)
+
+    def test_poi_display_data_uses_strict_item_allowlist_and_limit(self):
+        payload = poi_status()
+        base_item = payload["results"][0]
+        payload["results"] = []
+        for index in range(7):
+            item = copy.deepcopy(base_item)
+            item["rank"] = index + 1
+            item["name"] = f"地点{index + 1}"
+            item["api_key"] = "fake-api-key-that-must-not-leak"
+            item["provider_raw"] = {"infocode": "10000"}
+            item["request_url"] = "https://provider.invalid/sensitive"
+            payload["results"].append(item)
+
+        display_data = service._build_poi_display_data(payload)
+
+        self.assertEqual(len(display_data["items"]), 5)
+        allowed = service.POI_DISPLAY_ITEM_FIELDS
+        for item in display_data["items"]:
+            self.assertTrue(set(item).issubset(allowed))
+        serialized = json.dumps(display_data, ensure_ascii=False)
+        self.assertNotIn("api_key", serialized)
+        self.assertNotIn("provider_raw", serialized)
+        self.assertNotIn("request_url", serialized)
+        self.assertNotIn("infocode", serialized)
+        self.assertNotIn("fake-api-key", serialized)
+
+    def test_poi_display_location_has_only_coordinates(self):
+        payload = poi_status()
+        payload["results"][0]["location"].update(
+            {
+                "formatted_address": "不得返回",
+                "provider_id": "secret",
+            }
+        )
+
+        display_data = service._build_poi_display_data(payload)
+        location = display_data["items"][0]["location"]
+
+        self.assertEqual(set(location), {"longitude", "latitude"})
+        self.assertEqual(
+            set(location),
+            service.POI_DISPLAY_LOCATION_FIELDS,
+        )
+
+    def test_poi_display_ignores_invalid_field_types(self):
+        payload = poi_status()
+        item = payload["results"][0]
+        item.update(
+            {
+                "distance_m": "142",
+                "rating": float("nan"),
+                "cost_per_person": -1,
+                "tags": ["中餐", 42, "  "],
+                "location": {
+                    "longitude": 999,
+                    "latitude": "39.9",
+                },
+            }
+        )
+
+        display_item = service._build_poi_display_data(payload)["items"][0]
+
+        self.assertNotIn("distance_m", display_item)
+        self.assertNotIn("rating", display_item)
+        self.assertNotIn("cost_per_person", display_item)
+        self.assertEqual(display_item["tags"], ["中餐"])
+        self.assertNotIn("location", display_item)
+
+    def test_poi_non_result_statuses_have_no_display_data(self):
+        for status in (
+            "no_results",
+            "location_required",
+            "ambiguous_location",
+            "temporarily_unavailable",
+        ):
+            with self.subTest(status=status):
+                self.assertIsNone(
+                    service._build_poi_display_data(poi_status(status))
+                )
+
+    def test_poi_malformed_results_do_not_break_display_builder(self):
+        malformed_values = (
+            None,
+            [],
+            {"status": "results", "results": None},
+            {"status": "results", "results": [None, "bad"]},
+            {"status": "results", "results": [{"name": ""}]},
+        )
+        for value in malformed_values:
+            with self.subTest(value=value):
+                self.assertIsNone(service._build_poi_display_data(value))
+
+    @patch.object(service, "get_weather", return_value=weather_status("success"))
+    def test_weather_result_has_no_display_data(self, _weather_tool):
+        client = make_client(
+            response_with_tool_calls(
+                make_tool_call(
+                    '{"location":"郑州"}',
+                    name=service.WEATHER_TOOL_NAME,
+                )
+            ),
+            response_with_content("郑州今天晴。"),
+        )
+        with patch.object(service, "_get_chat_client", return_value=client):
+            result = service.run_agent_turn(
+                TEST_VISITOR_ID,
+                "郑州今天天气怎么样？",
+                self.messages,
+            )
+        self.assertIsNone(result["display_data"])
+
+    @patch.object(service, "knowledge_base_search", return_value=result_status("results"))
+    def test_knowledge_base_result_has_no_display_data(self, _search_tool):
+        client = make_client(
+            response_with_tool_calls(make_tool_call('{"query":"RAG"}')),
+            response_with_content("RAG 回答"),
+        )
+        with patch.object(service, "_get_chat_client", return_value=client):
+            result = service.run_agent_turn(
+                TEST_VISITOR_ID,
+                "根据我的知识库，什么是 RAG？",
+                self.messages,
+            )
+        self.assertIsNone(result["display_data"])
+
+    def test_direct_result_has_no_display_data(self):
+        client = make_client(response_with_content("普通回答"))
+        with patch.object(service, "_get_chat_client", return_value=client):
+            result = service.run_agent_turn(
+                TEST_VISITOR_ID,
+                "红烧肉怎么做？",
+                self.messages,
+            )
+        self.assertIsNone(result["display_data"])
+
     @patch.object(service, "search_poi", side_effect=RuntimeError("secret key and path"))
     def test_poi_tool_exception_is_safely_returned(self, poi_tool):
         client = make_client(

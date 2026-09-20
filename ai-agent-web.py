@@ -30,8 +30,10 @@ from rag_service import answer_with_rag
 from vector_store import (
     VectorStoreError,
     add_chunks,
+    delete_document,
     has_document,
     has_knowledge_base,
+    list_documents,
     search,
 )
 
@@ -99,6 +101,13 @@ TOOL_STATUS_LABELS = {
     "get_weather": "已查询实时天气",
     "search_poi": "已搜索城市地点",
     "knowledge_base_search": "已查询个人知识库",
+}
+
+KNOWLEDGE_DOCUMENT_TYPE_LABELS = {
+    "pdf": ("📄", "PDF"),
+    "docx": ("📝", "Word"),
+    "txt": ("📃", "TXT"),
+    "md": ("📘", "Markdown"),
 }
 
 
@@ -615,15 +624,165 @@ def render_history():
                         st.rerun()
 
 
-def render_knowledge_base():
-    """Render the multi-format in-memory knowledge-base upload workflow."""
-    st.title("我的知识库")
-    st.caption("把个人资料添加到 AI 助手，后续可以基于这些资料回答问题。")
+def add_uploaded_document_to_knowledge_base(uploaded_document):
+    """Process one confirmed upload while keeping the document list visible."""
+
+    file_bytes = uploaded_document.getvalue()
+    document_id = hashlib.sha256(file_bytes).hexdigest()
+    visitor_id = st.session_state.visitor_id
 
     try:
-        knowledge_base_exists = has_knowledge_base(
-            st.session_state.visitor_id
+        if has_document(visitor_id, document_id):
+            st.info("该文档已经存在，无需重复添加。")
+            return
+    except Exception:
+        st.error("知识库状态检查失败，请稍后重试。")
+        return
+
+    try:
+        document_result = process_document(
+            file_bytes,
+            source_file=uploaded_document.name,
+            content_type=uploaded_document.type,
         )
+    except DocumentProcessingError as exc:
+        st.error(str(exc))
+        return
+    except Exception:
+        st.error("文档解析失败，请确认文件完整且格式正确。")
+        return
+
+    try:
+        with st.spinner("正在整理资料并建立知识库…"):
+            embeddings = embed_chunks(document_result["chunks"])
+    except (EmbeddingServiceError, ValueError):
+        st.error("资料处理暂时失败，请稍后重试。")
+        return
+    except Exception:
+        st.error("资料处理暂时失败，请稍后重试。")
+        return
+
+    try:
+        add_chunks(visitor_id, document_result["chunks"], embeddings)
+    except (VectorStoreError, ValueError):
+        st.error("知识库保存失败，请稍后重试。")
+        return
+    except Exception:
+        st.error("知识库保存失败，请稍后重试。")
+        return
+
+    st.success("已添加到知识库。", icon=":material/check_circle:")
+    st.write(f"文件：{document_result['source_file']}")
+    _, type_label = KNOWLEDGE_DOCUMENT_TYPE_LABELS[
+        document_result["source_type"]
+    ]
+    st.write(f"类型：{type_label}")
+    if document_result.get("total_pages") is not None:
+        st.write(f"页数：{document_result['total_pages']}")
+    st.write(f"文本片段：{len(document_result['chunks'])}")
+
+
+def render_knowledge_base_documents(visitor_id):
+    """Render the current visitor's aggregated document list and delete UI."""
+
+    st.divider()
+    st.subheader("已添加的资料")
+
+    notice = st.session_state.pop("knowledge_base_notice", None)
+    if isinstance(notice, str) and notice:
+        st.success(escape_markdown(notice))
+
+    try:
+        documents = list_documents(visitor_id)
+    except Exception:
+        st.warning("知识库资料暂时无法读取。")
+        return
+
+    if not documents:
+        st.caption("还没有添加资料。")
+        st.session_state.pending_delete_document_id = None
+        return
+
+    document_ids = {document["document_id"] for document in documents}
+    if st.session_state.get("pending_delete_document_id") not in document_ids:
+        st.session_state.pending_delete_document_id = None
+
+    for position, document in enumerate(documents):
+        source_file = str(document["source_file"])
+        source_type = str(document["source_type"])
+        icon, type_label = KNOWLEDGE_DOCUMENT_TYPE_LABELS[source_type]
+        is_pending = (
+            st.session_state.get("pending_delete_document_id")
+            == document["document_id"]
+        )
+
+        with st.container(border=True):
+            details_column, action_column = st.columns(
+                [5, 1],
+                vertical_alignment="center",
+            )
+            with details_column:
+                st.markdown(f"**{escape_markdown(source_file)}**")
+                st.caption(
+                    f"{icon} {type_label} · {document['chunk_count']} 个文本片段"
+                )
+            with action_column:
+                if st.button(
+                    "删除",
+                    key=f"delete_knowledge_document_{position}",
+                    icon=":material/delete:",
+                    width="stretch",
+                ):
+                    st.session_state.pending_delete_document_id = document["document_id"]
+                    st.rerun()
+
+            if is_pending:
+                st.warning(
+                    f"确定删除《{escape_markdown(source_file)}》吗？"
+                    "删除后 AI 将无法再从该文档检索内容。"
+                )
+                with st.container(horizontal=True):
+                    if st.button(
+                        "确认删除",
+                        key=f"confirm_delete_knowledge_document_{position}",
+                        type="primary",
+                    ):
+                        try:
+                            deleted = delete_document(
+                                visitor_id,
+                                document["document_id"],
+                            )
+                        except Exception:
+                            deleted = False
+
+                        if deleted:
+                            st.session_state.pending_delete_document_id = None
+                            st.session_state.knowledge_base_notice = (
+                                f"已从知识库删除《{source_file}》"
+                            )
+                            st.rerun()
+                        st.error("暂时无法删除该资料，请稍后再试。")
+
+                    if st.button(
+                        "取消",
+                        key=f"cancel_delete_knowledge_document_{position}",
+                    ):
+                        st.session_state.pending_delete_document_id = None
+                        st.rerun()
+
+
+def render_knowledge_base():
+    """Render document upload and management for the current visitor."""
+
+    visitor_id = st.session_state.visitor_id
+    st.title("我的知识库")
+    st.caption(
+        "把 PDF、Word、TXT、Markdown 添加到你的个人知识库，"
+        "AI 可以根据这些资料回答问题。"
+    )
+
+    try:
+        knowledge_base_exists = has_knowledge_base(visitor_id)
     except Exception:
         knowledge_base_exists = False
         st.warning("知识库状态暂时无法读取。")
@@ -656,59 +815,10 @@ def render_knowledge_base():
             icon=":material/upload_file:",
             disabled=uploaded_document is None or document_too_large,
         )
-        if not add_to_knowledge_base or document_too_large:
-            return
+        if add_to_knowledge_base and not document_too_large:
+            add_uploaded_document_to_knowledge_base(uploaded_document)
 
-        file_bytes = uploaded_document.getvalue()
-        document_id = hashlib.sha256(file_bytes).hexdigest()
-        visitor_id = st.session_state.visitor_id
-
-        try:
-            if has_document(visitor_id, document_id):
-                st.info("该文档已经存在，无需重复添加。")
-                return
-        except Exception:
-            st.error("知识库状态检查失败，请稍后重试。")
-            return
-
-        try:
-            document_result = process_document(
-                file_bytes,
-                source_file=uploaded_document.name,
-                content_type=uploaded_document.type,
-            )
-        except DocumentProcessingError as exc:
-            st.error(str(exc))
-            return
-        except Exception:
-            st.error("文档解析失败，请确认文件完整且格式正确。")
-            return
-
-        try:
-            with st.spinner("正在整理资料并建立知识库…"):
-                embeddings = embed_chunks(document_result["chunks"])
-        except (EmbeddingServiceError, ValueError):
-            st.error("资料处理暂时失败，请稍后重试。")
-            return
-        except Exception:
-            st.error("资料处理暂时失败，请稍后重试。")
-            return
-
-        try:
-            add_chunks(visitor_id, document_result["chunks"], embeddings)
-        except (VectorStoreError, ValueError):
-            st.error("知识库保存失败，请稍后重试。")
-            return
-        except Exception:
-            st.error("知识库保存失败，请稍后重试。")
-            return
-
-        st.success("已添加到知识库。", icon=":material/check_circle:")
-        st.write(f"文件：{document_result['source_file']}")
-        st.write(f"类型：{document_result['source_type'].upper()}")
-        if document_result.get("total_pages") is not None:
-            st.write(f"页数：{document_result['total_pages']}")
-        st.write(f"文本片段：{len(document_result['chunks'])}")
+    render_knowledge_base_documents(visitor_id)
 
 
 def initialize_ui_state():
@@ -718,6 +828,7 @@ def initialize_ui_state():
     st.session_state.setdefault("home_scenario", None)
     st.session_state.setdefault("renaming_conversation_id", None)
     st.session_state.setdefault("pending_delete_conversation_id", None)
+    st.session_state.setdefault("pending_delete_document_id", None)
 
 
 def select_view(view_name):
@@ -725,6 +836,7 @@ def select_view(view_name):
     st.session_state.active_view = view_name
     st.session_state.renaming_conversation_id = None
     st.session_state.pending_delete_conversation_id = None
+    st.session_state.pending_delete_document_id = None
 
 
 def queue_prompt(prompt):

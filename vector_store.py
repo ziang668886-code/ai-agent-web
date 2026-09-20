@@ -24,6 +24,18 @@ REQUIRED_CHUNK_FIELDS = {
     "chunk_index",
 }
 SUPPORTED_SOURCE_TYPES = {"pdf", "docx", "txt", "md"}
+INDEX_ARRAY_FIELDS = (
+    "embeddings",
+    "chunk_texts",
+    "document_ids",
+    "chunk_ids",
+    "source_files",
+    "page_numbers",
+    "chunk_indexes",
+    "source_types",
+    "locator_types",
+    "locator_values",
+)
 
 
 class VectorStoreError(RuntimeError):
@@ -254,6 +266,105 @@ def has_document(visitor_id: str, document_id: str) -> bool:
     except KeyError as exc:
         raise VectorStoreError("向量索引缺少文档标识数据。") from exc
     return bool(np.any(document_ids == safe_document_id))
+
+
+def _normalized_index_document_ids(data: Mapping[str, np.ndarray]) -> np.ndarray:
+    """Return validated, canonical document IDs from loaded index data."""
+
+    normalized: list[str] = []
+    try:
+        stored_ids = data["document_ids"]
+    except KeyError as exc:
+        raise VectorStoreError("向量索引缺少文档标识数据。") from exc
+
+    for value in stored_ids:
+        try:
+            normalized.append(_validated_document_id(str(value)))
+        except ValueError as exc:
+            raise VectorStoreError("向量索引包含无效文档标识。") from exc
+    return np.asarray(normalized, dtype=np.str_)
+
+
+def _safe_index_source_file(value: object) -> str:
+    """Return an index filename without exposing a stored directory path."""
+
+    normalized = str(value or "未知文件").replace("\\", "/")
+    return normalized.rsplit("/", 1)[-1] or "未知文件"
+
+
+def list_documents(visitor_id: str) -> list[dict]:
+    """List documents aggregated from one visitor's isolated vector index."""
+
+    index_path = _index_path(visitor_id)
+    if not index_path.is_file():
+        return []
+
+    lock = FileLock(f"{index_path}.lock")
+    with lock:
+        if not index_path.is_file():
+            return []
+        data = _load_index(index_path)
+
+    document_ids = _normalized_index_document_ids(data)
+    documents: dict[str, dict] = {}
+    for index, document_id in enumerate(document_ids):
+        source_type = str(data["source_types"][index]).lower()
+        if source_type not in SUPPORTED_SOURCE_TYPES:
+            raise VectorStoreError("向量索引包含无效文档类型。")
+        source_file = _safe_index_source_file(data["source_files"][index])
+
+        existing = documents.get(document_id)
+        if existing is None:
+            documents[document_id] = {
+                "document_id": document_id,
+                "source_file": source_file,
+                "source_type": source_type,
+                "chunk_count": 1,
+            }
+            continue
+
+        if (
+            existing["source_file"] != source_file
+            or existing["source_type"] != source_type
+        ):
+            raise VectorStoreError("同一文档的索引元数据不一致。")
+        existing["chunk_count"] += 1
+
+    return list(documents.values())
+
+
+def delete_document(visitor_id: str, document_id: str) -> bool:
+    """Atomically delete all chunks for one document in one visitor index."""
+
+    safe_document_id = _validated_document_id(document_id)
+    index_path = _index_path(visitor_id)
+    if not index_path.is_file():
+        return False
+
+    lock = FileLock(f"{index_path}.lock")
+    with lock:
+        if not index_path.is_file():
+            return False
+        data = _load_index(index_path)
+        document_ids = _normalized_index_document_ids(data)
+        delete_mask = document_ids == safe_document_id
+        if not bool(np.any(delete_mask)):
+            return False
+
+        keep_mask = np.logical_not(delete_mask)
+        if not bool(np.any(keep_mask)):
+            try:
+                index_path.unlink()
+            except OSError as exc:
+                raise VectorStoreError("向量索引删除失败。") from exc
+            return True
+
+        filtered_data = {
+            name: data[name][keep_mask]
+            for name in INDEX_ARRAY_FIELDS
+        }
+        _atomic_save(index_path, filtered_data)
+        return True
 
 
 def search(

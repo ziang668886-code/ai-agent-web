@@ -26,7 +26,15 @@ from document_processor import (
     process_document,
 )
 from embedding_service import EmbeddingServiceError, embed_chunks, embed_text
-from location_component import render_geolocation_button
+from location_component import (
+    location_button_label,
+    location_status_message,
+    render_geolocation_button,
+    resolve_permission_state_update,
+    resolve_request_state_update,
+    should_attempt_auto_location,
+    should_consume_auto_attempt,
+)
 from location_context import (
     COARSE_LOCATION_FIELDS,
     LocationContextError,
@@ -838,6 +846,9 @@ def initialize_ui_state():
     st.session_state.setdefault("pending_delete_document_id", None)
     st.session_state.setdefault("current_location", None)
     st.session_state.setdefault("location_permission_status", "idle")
+    st.session_state.setdefault("location_permission_state", "unknown")
+    st.session_state.setdefault("location_request_pending", False)
+    st.session_state.setdefault("auto_location_attempted", False)
 
 
 def select_view(view_name):
@@ -872,26 +883,68 @@ def apply_browser_location_result(component_result):
 
 
 def render_location_controls():
-    """Render opt-in browser location controls without exposing coordinates."""
-    status = st.session_state.location_permission_status
-    button_label = "重新定位" if status != "idle" else "获取我的位置"
-    component_result = render_geolocation_button(button_label=button_label)
-    if component_result is not None:
-        apply_browser_location_result(component_result)
-        st.rerun()
+    """Render opt-in browser location controls without exposing coordinates.
+
+    Only a real location result forces ``st.rerun``. Permission and request
+    state changes are applied in this run, because rerunning while the browser
+    is still acquiring a position reconfigured the component and could strand
+    its callback.
+    """
 
     location = st.session_state.current_location
+    status = st.session_state.location_permission_status
+    component_result = render_geolocation_button(
+        button_label=location_button_label(
+            attempt_status=status,
+            has_current_location=location is not None,
+        ),
+        auto_attempt=should_attempt_auto_location(
+            has_current_location=location is not None,
+            already_attempted=bool(st.session_state.auto_location_attempted),
+        ),
+    )
+
+    if component_result.location_result is not None:
+        apply_browser_location_result(component_result.location_result)
+
+    request_pending = resolve_request_state_update(
+        stored_pending=bool(st.session_state.location_request_pending),
+        reported_state=component_result.request_state,
+    )
+    if request_pending is not None:
+        st.session_state.location_request_pending = request_pending
+
+    # 只有浏览器真正报告了结果，或明确报告请求已结束，才消费这次自动尝试。
+    # 于是在请求进行中 data.auto_attempt 保持不变，组件不会被重新配置。
+    if should_consume_auto_attempt(
+        already_attempted=bool(st.session_state.auto_location_attempted),
+        has_location_result=component_result.location_result is not None,
+        request_finished=component_result.request_state == "finished",
+    ):
+        st.session_state.auto_location_attempted = True
+
+    permission_state = resolve_permission_state_update(
+        st.session_state.location_permission_state,
+        component_result.permission_state,
+    )
+    if permission_state is not None:
+        st.session_state.location_permission_state = permission_state
+
+    if component_result.location_result is not None:
+        st.rerun()
+
     if status == "granted" and location is not None:
         st.success("当前位置已获取")
         st.caption(f"定位精度约 {location['accuracy_m']:.0f} 米")
-    elif status == "denied":
-        st.caption("未获得位置权限，你仍可以手动输入城市或地点。")
-    elif status == "timeout":
-        st.caption("定位超时，请稍后重试。")
-    elif status == "unsupported":
-        st.caption("当前浏览器环境不支持定位。")
-    elif status == "unavailable":
-        st.caption("暂时无法获取位置，请稍后重试。")
+        return
+
+    message = location_status_message(
+        attempt_status=status,
+        permission_state=st.session_state.location_permission_state,
+        has_current_location=location is not None,
+    )
+    if message:
+        st.caption(message)
 
 
 def render_sidebar_navigation():

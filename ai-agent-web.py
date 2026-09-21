@@ -26,6 +26,13 @@ from document_processor import (
     process_document,
 )
 from embedding_service import EmbeddingServiceError, embed_chunks, embed_text
+from location_component import render_geolocation_button
+from location_context import (
+    COARSE_LOCATION_FIELDS,
+    LocationContextError,
+    validate_current_location,
+    validate_geolocation_result,
+)
 from rag_service import answer_with_rag
 from vector_store import (
     VectorStoreError,
@@ -829,6 +836,8 @@ def initialize_ui_state():
     st.session_state.setdefault("renaming_conversation_id", None)
     st.session_state.setdefault("pending_delete_conversation_id", None)
     st.session_state.setdefault("pending_delete_document_id", None)
+    st.session_state.setdefault("current_location", None)
+    st.session_state.setdefault("location_permission_status", "idle")
 
 
 def select_view(view_name):
@@ -849,11 +858,49 @@ def queue_prompt(prompt):
     return True
 
 
+def apply_browser_location_result(component_result):
+    """Store one validated component result in the current Streamlit session."""
+    try:
+        status, location = validate_geolocation_result(component_result)
+    except LocationContextError:
+        st.session_state.current_location = None
+        st.session_state.location_permission_status = "unavailable"
+        return
+
+    st.session_state.location_permission_status = status
+    st.session_state.current_location = location if status == "granted" else None
+
+
+def render_location_controls():
+    """Render opt-in browser location controls without exposing coordinates."""
+    status = st.session_state.location_permission_status
+    button_label = "重新定位" if status != "idle" else "获取我的位置"
+    component_result = render_geolocation_button(button_label=button_label)
+    if component_result is not None:
+        apply_browser_location_result(component_result)
+        st.rerun()
+
+    location = st.session_state.current_location
+    if status == "granted" and location is not None:
+        st.success("当前位置已获取")
+        st.caption(f"定位精度约 {location['accuracy_m']:.0f} 米")
+    elif status == "denied":
+        st.caption("未获得位置权限，你仍可以手动输入城市或地点。")
+    elif status == "timeout":
+        st.caption("定位超时，请稍后重试。")
+    elif status == "unsupported":
+        st.caption("当前浏览器环境不支持定位。")
+    elif status == "unavailable":
+        st.caption("暂时无法获取位置，请稍后重试。")
+
+
 def render_sidebar_navigation():
     """Render app identity and the single-view product navigation."""
     with st.sidebar:
         st.markdown("### AI 城市生活助手")
         st.caption("发现城市里的吃喝玩乐")
+        render_location_controls()
+        st.divider()
 
         for view_name, label, icon in NAVIGATION_ITEMS:
             if st.button(
@@ -1319,6 +1366,7 @@ def handle_user_message(question):
                 visitor_id=st.session_state.visitor_id,
                 user_question=question,
                 chat_messages=st.session_state.messages,
+                current_location=st.session_state.current_location,
             )
         except Exception:
             agent_result = {"ok": False}
@@ -1327,14 +1375,37 @@ def handle_user_message(question):
         st.error("AI 服务暂时不可用，请稍后重试。")
         return
 
+    location_context_update = agent_result.get("location_context_update")
+    if (
+        isinstance(location_context_update, dict)
+        and isinstance(st.session_state.current_location, dict)
+    ):
+        allowed_location_fields = COARSE_LOCATION_FIELDS
+        if set(location_context_update).issubset(allowed_location_fields):
+            updated_location = dict(st.session_state.current_location)
+            updated_location.update(location_context_update)
+            try:
+                st.session_state.current_location = validate_current_location(
+                    updated_location
+                )
+            except LocationContextError:
+                pass
+
     answer = agent_result["answer"]
     if agent_result.get("mode") == "tool" and agent_result.get("sources"):
         answer = add_sources_to_answer(answer, agent_result["sources"])
 
-    tool_name = agent_result.get("tool_name")
-    tool_status_label = TOOL_STATUS_LABELS.get(tool_name)
-    if tool_status_label:
-        st.caption(f"✓ {tool_status_label}")
+    tool_names = agent_result.get("tool_names")
+    if not isinstance(tool_names, list):
+        tool_names = [agent_result.get("tool_name")]
+    shown_tool_names = set()
+    for tool_name in tool_names:
+        if tool_name in shown_tool_names:
+            continue
+        shown_tool_names.add(tool_name)
+        tool_status_label = TOOL_STATUS_LABELS.get(tool_name)
+        if tool_status_label:
+            st.caption(f"✓ {tool_status_label}")
 
     with st.chat_message("assistant"):
         st.write(answer)

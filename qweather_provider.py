@@ -119,6 +119,31 @@ class QWeatherProvider:
 
         return _convert_current_weather(city_name, weather_data)
 
+    def fetch_current_weather_by_coordinates(
+        self,
+        latitude: float,
+        longitude: float,
+        *,
+        label: str,
+    ) -> Mapping[str, Any]:
+        """Query Current Weather v1 directly without a GeoAPI lookup."""
+
+        latitude_path = _direct_coordinate(latitude, -90, 90)
+        longitude_path = _direct_coordinate(longitude, -180, 180)
+        weather_data = self._get_json(
+            QWEATHER_CURRENT_WEATHER_PATH.format(
+                latitude=latitude_path,
+                longitude=longitude_path,
+            ),
+            params={"lang": "zh", "localTime": "true"},
+        )
+        safe_label = (
+            label.strip()
+            if isinstance(label, str) and label.strip()
+            else "当前位置"
+        )
+        return _convert_current_weather(safe_label, weather_data)
+
     def _get_json(
         self,
         path: str,
@@ -205,6 +230,18 @@ def _coordinate(
     if not minimum <= number <= maximum:
         raise WeatherServiceError("QWeather GeoAPI returned invalid coordinates")
     return str(data[field]).strip()
+
+
+def _direct_coordinate(value: Any, minimum: float, maximum: float) -> str:
+    if isinstance(value, bool):
+        raise WeatherServiceError("Invalid weather coordinates")
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise WeatherServiceError("Invalid weather coordinates") from exc
+    if not math.isfinite(number) or not minimum <= number <= maximum:
+        raise WeatherServiceError("Invalid weather coordinates")
+    return f"{number:.8f}".rstrip("0").rstrip(".")
 
 
 def _nested_mapping(data: Mapping[str, Any], field: str) -> Mapping[str, Any]:

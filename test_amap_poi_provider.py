@@ -33,6 +33,8 @@ except ModuleNotFoundError:
 
 from amap_poi_provider import (
     AMAP_AROUND_SEARCH_PATH,
+    AMAP_COORDINATE_CONVERT_PATH,
+    AMAP_REVERSE_GEOCODE_PATH,
     AMAP_TEXT_SEARCH_PATH,
     AmapPOIProvider,
 )
@@ -113,6 +115,123 @@ class AmapPOIProviderTests(unittest.TestCase):
         self.assertEqual(params["location"], "116.397128,39.916527")
         self.assertEqual(params["radius"], 3000)
         self.assertEqual(params["region"], "北京")
+
+    def test_gps_coordinate_conversion_uses_official_endpoint_and_order(self):
+        payload = {
+            "status": "1",
+            "info": "OK",
+            "infocode": "10000",
+            "locations": "113.631000,34.751000",
+        }
+        provider, client, _ = self.make_provider(payload)
+
+        result = provider.convert_wgs84_to_gcj02(34.7466, 113.6254)
+
+        args, kwargs = client.get.call_args
+        self.assertTrue(args[0].endswith(AMAP_COORDINATE_CONVERT_PATH))
+        self.assertEqual(kwargs["params"]["locations"], "113.625400,34.746600")
+        self.assertEqual(kwargs["params"]["coordsys"], "gps")
+        self.assertEqual(result, {"longitude": 113.631, "latitude": 34.751})
+
+    def test_reverse_geocode_returns_township_but_no_precise_address(self):
+        payload = {
+            "status": "1",
+            "info": "OK",
+            "infocode": "10000",
+            "regeocode": {
+                "formatted_address": "河南省郑州市金水区敏感路1号敏感小区",
+                "addressComponent": {
+                    "province": "河南省",
+                    "city": "郑州市",
+                    "district": "金水区",
+                    "township": "莲湖街道",
+                    "streetNumber": {"street": "敏感路", "number": "1号"},
+                    "neighborhood": {"name": "敏感小区"},
+                    "building": {"name": "敏感楼栋"},
+                },
+            },
+        }
+        provider, client, _ = self.make_provider(payload)
+
+        result = provider.reverse_geocode(
+            latitude=34.751,
+            longitude=113.631,
+        )
+
+        args, kwargs = client.get.call_args
+        self.assertTrue(args[0].endswith(AMAP_REVERSE_GEOCODE_PATH))
+        self.assertEqual(kwargs["params"]["extensions"], "base")
+        self.assertEqual(
+            result,
+            {
+                "province": "河南省",
+                "city": "郑州市",
+                "district": "金水区",
+                "township": "莲湖街道",
+                "label": "河南省郑州市金水区莲湖街道",
+            },
+        )
+        # 门牌号、街道名、小区、楼栋与完整地址都不保留。
+        self.assertNotIn("敏感", str(result))
+        self.assertNotIn("formatted_address", result)
+        self.assertNotIn("street", result)
+        self.assertNotIn("number", result)
+
+    def test_reverse_geocode_falls_back_to_street_when_township_is_empty(self):
+        payload = {
+            "status": "1",
+            "info": "OK",
+            "infocode": "10000",
+            "regeocode": {
+                "formatted_address": "河南省郑州市金水区花园路1号",
+                "addressComponent": {
+                    "province": "河南省",
+                    "city": "郑州市",
+                    "district": "金水区",
+                    "township": [],
+                    "streetNumber": {"street": "花园路", "number": "1号"},
+                },
+            },
+        }
+        provider, _, _ = self.make_provider(payload)
+
+        result = provider.reverse_geocode(latitude=34.751, longitude=113.631)
+
+        self.assertEqual(result["street"], "花园路")
+        self.assertNotIn("township", result)
+        self.assertEqual(result["label"], "河南省郑州市金水区花园路")
+        self.assertNotIn("1号", str(result))
+
+    def test_gps_nearby_search_does_not_add_city_filter(self):
+        provider, client, _ = self.make_provider(success_payload([raw_poi()]))
+
+        provider.search_nearby(
+            "餐厅",
+            None,
+            longitude=113.631,
+            latitude=34.751,
+            radius=3000,
+            limit=5,
+        )
+
+        params = client.get.call_args.kwargs["params"]
+        self.assertNotIn("region", params)
+        self.assertNotIn("city_limit", params)
+
+    def test_coordinate_conversion_failure_is_sanitized(self):
+        provider, _, _ = self.make_provider(
+            {
+                "status": "1",
+                "info": "OK",
+                "infocode": "10000",
+                "locations": "secret-invalid-location",
+            }
+        )
+
+        with self.assertRaises(POIServiceError) as caught:
+            provider.convert_wgs84_to_gcj02(34.7466, 113.6254)
+
+        self.assertNotIn("secret", str(caught.exception))
 
     def test_all_supported_fields_are_converted(self):
         provider, _, _ = self.make_provider(success_payload([raw_poi()]))

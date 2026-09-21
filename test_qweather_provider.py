@@ -8,7 +8,12 @@ from unittest.mock import Mock
 import httpx
 
 from qweather_provider import QWeatherProvider
-from weather_service import UnknownLocationError, WeatherServiceError, fetch_weather
+from weather_service import (
+    UnknownLocationError,
+    WeatherServiceError,
+    fetch_weather,
+    fetch_weather_by_coordinates,
+)
 
 
 TEST_HOST = "test-host.qweatherapi.com"
@@ -97,6 +102,53 @@ class QWeatherProviderTests(unittest.TestCase):
 
         self.assertEqual(result["location"], "第一结果")
         self.assertIn("/34.7/113.6", client.get.call_args_list[1].args[0])
+
+    def test_coordinates_call_current_weather_without_geo_lookup(self):
+        provider, client = self.make_provider(response(current_payload()))
+
+        result = provider.fetch_current_weather_by_coordinates(
+            34.7466,
+            113.6254,
+            label="当前位置",
+        )
+
+        self.assertEqual(result["location"], "当前位置")
+        self.assertEqual(result["weather"], "晴")
+        self.assertEqual(client.get.call_count, 1)
+        request_url = client.get.call_args.args[0]
+        self.assertTrue(
+            request_url.endswith("/weather/v1/current/34.7466/113.6254")
+        )
+        self.assertNotIn("/geo/", request_url)
+
+    def test_coordinate_service_returns_only_normalized_weather(self):
+        provider, _ = self.make_provider(
+            response(current_payload(provider_secret="do-not-return"))
+        )
+
+        result = fetch_weather_by_coordinates(
+            34.7466,
+            113.6254,
+            label="当前位置",
+            provider=provider,
+        )
+
+        self.assertEqual(result["location"], "当前位置")
+        self.assertNotIn("latitude", result)
+        self.assertNotIn("longitude", result)
+        self.assertNotIn("provider_secret", result)
+
+    def test_coordinate_provider_rejects_invalid_values_before_request(self):
+        provider, client = self.make_provider(response(current_payload()))
+
+        with self.assertRaises(WeatherServiceError):
+            provider.fetch_current_weather_by_coordinates(
+                91,
+                113.6254,
+                label="当前位置",
+            )
+
+        client.get.assert_not_called()
 
     def test_unknown_city_raises_stable_location_error(self):
         provider, _ = self.make_provider(response(geo_payload()))

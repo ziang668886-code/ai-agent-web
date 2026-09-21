@@ -9,7 +9,9 @@ from weather_service import (
     WeatherProvider,
     WeatherServiceError,
     fetch_weather,
+    fetch_weather_by_coordinates,
 )
+from location_context import LocationContextError, validate_current_location
 
 
 MAX_LOCATION_LENGTH = 100
@@ -19,8 +21,9 @@ GET_WEATHER_TOOL = {
     "function": {
         "name": "get_weather",
         "description": (
-            "查询指定城市的实时天气或近期天气信息。当用户询问当前天气、"
-            "今天或明天天气、温度、降雨、风力或天气状况等实时信息时使用。"
+            "查询指定城市或用户当前位置的实时天气。明确地点使用 location；"
+            "用户明确说‘我这里’、‘当前位置’时使用 use_current_location=true。"
+            "两个参数必须且只能提供一个。"
         ),
         "parameters": {
             "type": "object",
@@ -29,9 +32,13 @@ GET_WEATHER_TOOL = {
                     "type": "string",
                     "description": "城市或地区名称，例如郑州、北京、上海。",
                     "maxLength": MAX_LOCATION_LENGTH,
-                }
+                },
+                "use_current_location": {
+                    "type": "boolean",
+                    "description": "仅当用户明确要求查询当前所在位置时设为 true。",
+                },
             },
-            "required": ["location"],
+            "required": [],
             "additionalProperties": False,
         },
     },
@@ -56,28 +63,61 @@ def _temporarily_unavailable() -> dict[str, Any]:
     }
 
 
+def _location_required() -> dict[str, Any]:
+    return {
+        "ok": False,
+        "status": "location_required",
+        "message": "需要先获取当前位置，或者提供城市或具体地点。",
+    }
+
+
 def get_weather(
-    location: str,
+    location: str | None = None,
     *,
+    use_current_location: bool = False,
+    current_location: Any = None,
     provider: WeatherProvider | None = None,
 ) -> dict[str, Any]:
     """Return normalized weather for a server-selected provider.
 
-    Only ``location`` is model-visible. ``provider`` is an internal dependency
-    that will later be configured by the server, never by model arguments.
+    Only ``location`` and ``use_current_location`` are model-visible. Exact
+    coordinates and ``provider`` are server-only dependencies.
     """
 
-    if not isinstance(location, str):
+    if not isinstance(use_current_location, bool):
         return _invalid_location()
-    normalized_location = location.strip()
-    if not normalized_location or len(normalized_location) > MAX_LOCATION_LENGTH:
+    if use_current_location and location is not None:
+        return _invalid_location()
+    if not use_current_location and not isinstance(location, str):
+        return _invalid_location()
+
+    normalized_location = location.strip() if isinstance(location, str) else None
+    if (
+        not use_current_location
+        and (
+            not normalized_location
+            or len(normalized_location) > MAX_LOCATION_LENGTH
+        )
+    ):
         return _invalid_location()
 
     try:
-        weather = fetch_weather(
-            normalized_location,
-            provider=provider,
-        )
+        if use_current_location:
+            try:
+                trusted_location = validate_current_location(current_location)
+            except LocationContextError:
+                return _location_required()
+            weather = fetch_weather_by_coordinates(
+                trusted_location["latitude"],
+                trusted_location["longitude"],
+                label="当前位置",
+                provider=provider,
+            )
+        else:
+            weather = fetch_weather(
+                normalized_location,
+                provider=provider,
+            )
     except UnknownLocationError:
         return _invalid_location()
     except WeatherServiceError:

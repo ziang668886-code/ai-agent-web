@@ -25,6 +25,15 @@ class WeatherProvider(Protocol):
     def fetch_current_weather(self, location: str) -> Mapping[str, Any] | None:
         """Fetch raw current weather data for one normalized location."""
 
+    def fetch_current_weather_by_coordinates(
+        self,
+        latitude: float,
+        longitude: float,
+        *,
+        label: str,
+    ) -> Mapping[str, Any] | None:
+        """Fetch current weather directly for trusted WGS84 coordinates."""
+
 
 def _optional_number(value: Any, field_name: str) -> int | float | None:
     if value is None or value == "":
@@ -119,3 +128,55 @@ def fetch_weather(
                     pass
 
     return normalize_weather_response(raw_data, location)
+
+
+def fetch_weather_by_coordinates(
+    latitude: float,
+    longitude: float,
+    *,
+    label: str = "当前位置",
+    provider: WeatherProvider | None = None,
+) -> dict[str, Any]:
+    """Fetch weather directly for server-held WGS84 coordinates.
+
+    This path intentionally skips city GeoAPI lookup. Coordinates are used only
+    for the provider call and never enter the normalized result.
+    """
+
+    if (
+        isinstance(latitude, bool)
+        or not isinstance(latitude, (int, float))
+        or not math.isfinite(latitude)
+        or not -90 <= latitude <= 90
+        or isinstance(longitude, bool)
+        or not isinstance(longitude, (int, float))
+        or not math.isfinite(longitude)
+        or not -180 <= longitude <= 180
+    ):
+        raise WeatherServiceError("Invalid current location coordinates")
+
+    normalized_label = _optional_text(label) or "当前位置"
+    created_provider = provider is None
+    if created_provider:
+        from qweather_provider import QWeatherProvider
+
+        provider = QWeatherProvider.from_environment()
+
+    try:
+        raw_data = provider.fetch_current_weather_by_coordinates(
+            float(latitude),
+            float(longitude),
+            label=normalized_label,
+        )
+    except Exception as exc:
+        raise WeatherServiceError("Weather provider request failed") from exc
+    finally:
+        if created_provider:
+            close = getattr(provider, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
+
+    return normalize_weather_response(raw_data, normalized_label)

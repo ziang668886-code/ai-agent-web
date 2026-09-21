@@ -7,6 +7,8 @@ import re
 from collections.abc import Mapping, Sequence
 from typing import Any, Protocol
 
+from location_context import LocationContextError, validate_current_location
+
 
 MAX_QUERY_LENGTH = 80
 MAX_CITY_LENGTH = 50
@@ -14,6 +16,63 @@ MAX_ANCHOR_LENGTH = 80
 MAX_POI_RESULTS = 5
 DEFAULT_RADIUS_METERS = 3000
 ANCHOR_CANDIDATE_LIMIT = 10
+# 当前位置搜索在工具结果里使用的占位城市名，供上层区分“当前位置无结果”。
+CURRENT_LOCATION_CITY = "当前位置"
+
+# “好玩的”这类模糊休闲意图没有对应的真实高德检索词，直接当关键词搜索只会
+# 召回一堆无关地点。这里确定性地映射到一个真实存在的高德 POI 类别词。
+# 一次只映射一个类别，不额外增加工具调用次数。
+VAGUE_LEISURE_CATEGORIES = {
+    "好玩": "景点",
+    "玩的": "景点",
+    "玩": "景点",
+    "逛": "购物中心",
+    "逛街": "购物中心",
+    "溜达": "公园",
+    "休闲": "休闲娱乐",
+    "娱乐": "休闲娱乐",
+    "休闲娱乐": "休闲娱乐",
+}
+
+# 去掉这些填充词后只剩一个模糊休闲词，才认定为模糊意图并改写。这样
+# “好玩又便宜的地方”这类仍然带有具体诉求的查询会保持原样。
+_LEISURE_FILLER_WORDS = (
+    "有什么",
+    "有没有",
+    "好去处",
+    "哪些",
+    "哪里",
+    "哪儿",
+    "去哪",
+    "附近",
+    "周边",
+    "周围",
+    "当地",
+    "地方",
+    "场所",
+    "推荐",
+    "可以",
+    "想去",
+    "去",
+    "我",
+    "你",
+    "有",
+    "点",
+    "的",
+)
+
+# 高德 POI 的 type 字段是一段分类层级文本，例如“风景名胜;公园广场;公园”。
+# 用它判断查询类别与结果类别是否一致：类别命中或类别缺失的排前面，类别明显
+# 不符的排后面。类别缺失时不降权，避免把真实结果全部过滤掉。
+QUERY_CATEGORY_TOKENS = (
+    (("咖啡",), ("餐饮服务", "咖啡")),
+    (("餐厅", "美食", "好吃的", "吃饭", "吃"), ("餐饮服务",)),
+    (("博物馆",), ("科教文化服务", "博物馆")),
+    (("商场", "购物中心", "逛街"), ("购物服务", "商场")),
+    (("公园", "绿地"), ("风景名胜", "公园广场", "公园")),
+    (("景点", "景区"), ("风景名胜", "旅游景点")),
+    (("酒店", "住宿"), ("住宿服务",)),
+)
 
 
 class POIServiceError(RuntimeError):
@@ -66,7 +125,7 @@ class POIProvider(Protocol):
     def search_nearby(
         self,
         query: str,
-        city: str,
+        city: str | None,
         *,
         longitude: float,
         latitude: float,
@@ -74,6 +133,13 @@ class POIProvider(Protocol):
         limit: int,
     ) -> Sequence[Mapping[str, Any]]:
         """Search POIs around a trusted server-selected coordinate."""
+
+    def convert_wgs84_to_gcj02(
+        self,
+        latitude: float,
+        longitude: float,
+    ) -> Mapping[str, float]:
+        """Convert a trusted browser coordinate with the provider API."""
 
 
 def validate_poi_inputs(
@@ -83,11 +149,13 @@ def validate_poi_inputs(
 ) -> tuple[str, str, str | None]:
     """Validate and normalize model-visible POI inputs."""
 
-    normalized_query = _validated_text(
-        query,
-        maximum=MAX_QUERY_LENGTH,
-        error_code="INVALID_QUERY",
-        message="请输入有效的地点搜索关键词。",
+    normalized_query = _leisure_category_query(
+        _validated_text(
+            query,
+            maximum=MAX_QUERY_LENGTH,
+            error_code="INVALID_QUERY",
+            message="请输入有效的地点搜索关键词。",
+        )
     )
     normalized_city = _validated_text(
         city,
@@ -273,6 +341,132 @@ def search_poi_service(
                     pass
 
 
+def search_poi_by_current_location_service(
+    query: Any,
+    current_location: Any,
+    *,
+    provider: POIProvider | None = None,
+) -> dict[str, Any]:
+    """Search a fixed 3km radius around a validated browser location."""
+
+    try:
+        normalized_query = _leisure_category_query(
+            _validated_text(
+                query,
+                maximum=MAX_QUERY_LENGTH,
+                error_code="INVALID_QUERY",
+                message="请输入有效的地点搜索关键词。",
+            )
+        )
+    except POIValidationError as exc:
+        return _invalid_request(exc.error_code, exc.message)
+
+    try:
+        trusted_location = validate_current_location(current_location)
+    except LocationContextError:
+        return {
+            "ok": False,
+            "status": "location_required",
+            "message": "需要先获取当前位置，或者提供城市或具体地点。",
+            "results": [],
+        }
+
+    created_provider = provider is None
+    active_provider = provider
+    try:
+        if active_provider is None:
+            from amap_poi_provider import AmapPOIProvider
+
+            active_provider = AmapPOIProvider.from_environment()
+
+        converted = active_provider.convert_wgs84_to_gcj02(
+            trusted_location["latitude"],
+            trusted_location["longitude"],
+        )
+        if not isinstance(converted, Mapping):
+            raise POIServiceError("Coordinate conversion returned invalid data")
+        longitude = converted.get("longitude")
+        latitude = converted.get("latitude")
+        if _normalized_location(
+            {"longitude": longitude, "latitude": latitude}
+        ) is None:
+            raise POIServiceError("Coordinate conversion returned invalid data")
+
+        raw_results = active_provider.search_nearby(
+            normalized_query,
+            None,
+            longitude=float(longitude),
+            latitude=float(latitude),
+            radius=DEFAULT_RADIUS_METERS,
+            limit=MAX_POI_RESULTS,
+        )
+        return _results_response(
+            query=normalized_query,
+            city=CURRENT_LOCATION_CITY,
+            search_mode="nearby",
+            anchor=None,
+            raw_results=raw_results,
+            no_results_message=(
+                f"当前位置约{DEFAULT_RADIUS_METERS // 1000}km范围内暂未找到"
+                "符合条件的地点，可以换一种类型，例如公园、商场或咖啡店。"
+            ),
+        )
+    except Exception:
+        return _temporarily_unavailable()
+    finally:
+        if created_provider and active_provider is not None:
+            close = getattr(active_provider, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
+
+
+def _leisure_category_query(query: str) -> str:
+    """Rewrite a vague leisure phrase into one concrete, searchable category."""
+
+    residual = query.casefold()
+    for filler in sorted(_LEISURE_FILLER_WORDS, key=len, reverse=True):
+        residual = residual.replace(filler, "")
+    residual = re.sub(r"[^一-鿿]", "", residual)
+    if not residual:
+        return query
+    return VAGUE_LEISURE_CATEGORIES.get(residual, query)
+
+
+def _query_category_tokens(query: str) -> tuple[str, ...] | None:
+    for keywords, tokens in QUERY_CATEGORY_TOKENS:
+        if any(keyword in query for keyword in keywords):
+            return tokens
+    return None
+
+
+def _ranked_by_category_relevance(
+    results: Sequence[dict[str, Any]],
+    query: str,
+) -> list[dict[str, Any]]:
+    """Put results whose Amap category matches the query ahead of name-only matches.
+
+    Nothing is dropped: results with a missing category keep their position, and
+    results whose category contradicts the query stay available at the end.
+    """
+
+    tokens = _query_category_tokens(query)
+    if tokens is None:
+        return list(results)
+
+    matched: list[dict[str, Any]] = []
+    unmatched: list[dict[str, Any]] = []
+    for item in results:
+        category = item.get("category")
+        if not category or any(token in category for token in tokens):
+            matched.append(item)
+        else:
+            unmatched.append(item)
+    return matched + unmatched
+
+
 def _validated_text(
     value: Any,
     *,
@@ -315,25 +509,29 @@ def _results_response(
     search_mode: str,
     anchor: str | None,
     raw_results: Sequence[Mapping[str, Any]],
+    no_results_message: str | None = None,
 ) -> dict[str, Any]:
     if not isinstance(raw_results, Sequence) or isinstance(raw_results, (str, bytes)):
         raise POIServiceError("POI provider returned invalid results")
 
-    results: list[dict[str, Any]] = []
+    normalized_results: list[dict[str, Any]] = []
     for item in raw_results:
         normalized = _normalize_result(item, search_mode)
-        if normalized is None:
-            continue
-        normalized["rank"] = len(results) + 1
-        results.append(normalized)
-        if len(results) >= MAX_POI_RESULTS:
-            break
+        if normalized is not None:
+            normalized_results.append(normalized)
+
+    results = _ranked_by_category_relevance(normalized_results, query)[
+        :MAX_POI_RESULTS
+    ]
+    for position, item in enumerate(results, start=1):
+        item["rank"] = position
 
     if not results:
         return {
             "ok": True,
             "status": "no_results",
-            "message": "没有找到符合条件的地点，可以尝试更换关键词或提供更具体的位置。",
+            "message": no_results_message
+            or "没有找到符合条件的地点，可以尝试更换关键词或提供更具体的位置。",
             "query": query,
             "city": city,
             "search_mode": search_mode,

@@ -23,6 +23,12 @@ class FakeProvider:
             raise self.error
         return self.results
 
+    def convert_wgs84_to_gcj02(self, latitude, longitude):
+        self.calls.append(("convert", latitude, longitude))
+        if self.error:
+            raise self.error
+        return {"longitude": 113.631, "latitude": 34.751}
+
 
 class POIToolTests(unittest.TestCase):
     def assert_invalid(self, result, code):
@@ -81,12 +87,69 @@ class POIToolTests(unittest.TestCase):
         self.assertEqual(result["status"], "temporarily_unavailable")
         self.assertNotIn("secret", str(result))
 
-    def test_schema_exposes_only_query_city_and_anchor(self):
+    def test_current_location_search_uses_server_context(self):
+        provider = FakeProvider(
+            [{"name": "附近咖啡", "distance_m": "280"}]
+        )
+        current_location = {
+            "latitude": 34.7466,
+            "longitude": 113.6254,
+            "accuracy_m": 20.0,
+            "coordinate_system": "wgs84",
+            "source": "browser_geolocation",
+        }
+
+        result = search_poi(
+            "咖啡店",
+            use_current_location=True,
+            current_location=current_location,
+            provider=provider,
+        )
+
+        self.assertEqual(result["status"], "results")
+        self.assertTrue(any(call[0] == "convert" for call in provider.calls))
+        nearby_call = next(call for call in provider.calls if call[0] == "nearby")
+        self.assertIsNone(nearby_call[1][1])
+
+    def test_current_location_cannot_be_combined_with_city_or_anchor(self):
+        provider = FakeProvider()
+        for kwargs in (
+            {"city": "北京"},
+            {"anchor": "故宫"},
+            {"city": "北京", "anchor": "故宫"},
+        ):
+            with self.subTest(kwargs=kwargs):
+                result = search_poi(
+                    "餐厅",
+                    use_current_location=True,
+                    current_location={},
+                    provider=provider,
+                    **kwargs,
+                )
+                self.assert_invalid(result, "INVALID_PARAMETERS")
+
+    def test_current_location_without_gps_requires_location(self):
+        result = search_poi(
+            "公园",
+            use_current_location=True,
+            current_location=None,
+            provider=FakeProvider(),
+        )
+        self.assertEqual(result["status"], "location_required")
+
+    def test_schema_exposes_location_choice_without_coordinates(self):
         function = SEARCH_POI_TOOL["function"]
         parameters = function["parameters"]
         self.assertEqual(function["name"], "search_poi")
-        self.assertEqual(set(parameters["properties"]), {"query", "city", "anchor"})
-        self.assertEqual(parameters["required"], ["query", "city"])
+        self.assertEqual(
+            set(parameters["properties"]),
+            {"query", "city", "anchor", "use_current_location"},
+        )
+        self.assertEqual(parameters["required"], ["query"])
+        schema_text = str(SEARCH_POI_TOOL).casefold()
+        self.assertNotIn("latitude", schema_text)
+        self.assertNotIn("longitude", schema_text)
+        self.assertNotIn("radius", schema_text)
         self.assertFalse(parameters["additionalProperties"])
 
     def test_tool_has_no_streamlit_database_or_visitor_dependency(self):

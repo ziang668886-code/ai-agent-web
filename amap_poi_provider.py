@@ -17,6 +17,8 @@ from poi_service import POIProviderNotConfiguredError, POIServiceError
 AMAP_BASE_URL = "https://restapi.amap.com"
 AMAP_TEXT_SEARCH_PATH = "/v5/place/text"
 AMAP_AROUND_SEARCH_PATH = "/v5/place/around"
+AMAP_COORDINATE_CONVERT_PATH = "/v3/assistant/coordinate/convert"
+AMAP_REVERSE_GEOCODE_PATH = "/v3/geocode/regeo"
 AMAP_TIMEOUT_SECONDS = 6.0
 AMAP_MAX_PAGE_SIZE = 25
 
@@ -85,7 +87,7 @@ class AmapPOIProvider:
     def search_nearby(
         self,
         query: str,
-        city: str,
+        city: str | None,
         *,
         longitude: float,
         latitude: float,
@@ -99,27 +101,111 @@ class AmapPOIProvider:
         if isinstance(radius, bool) or not isinstance(radius, int) or not 0 <= radius <= 50000:
             raise POIServiceError("Invalid nearby radius")
 
-        return self._request_pois(
-            AMAP_AROUND_SEARCH_PATH,
+        params: dict[str, Any] = {
+            "keywords": query,
+            "location": f"{float(longitude):.6f},{float(latitude):.6f}",
+            "radius": radius,
+            "show_fields": "business",
+            "page_size": _page_size(limit),
+            "page_num": 1,
+            "output": "json",
+        }
+        if isinstance(city, str) and city.strip():
+            params["region"] = city.strip()
+            params["city_limit"] = "true"
+        return self._request_pois(AMAP_AROUND_SEARCH_PATH, params=params)
+
+    def convert_wgs84_to_gcj02(
+        self,
+        latitude: float,
+        longitude: float,
+    ) -> dict[str, float]:
+        """Convert one browser GPS coordinate using Amap's official API."""
+
+        if not _valid_coordinate(longitude, latitude):
+            raise POIServiceError("Invalid coordinate conversion input")
+        payload = self._request_json(
+            AMAP_COORDINATE_CONVERT_PATH,
             params={
-                "keywords": query,
-                "location": f"{float(longitude):.6f},{float(latitude):.6f}",
-                "radius": radius,
-                "region": city,
-                "city_limit": "true",
-                "show_fields": "business",
-                "page_size": _page_size(limit),
-                "page_num": 1,
+                "locations": f"{float(longitude):.6f},{float(latitude):.6f}",
+                "coordsys": "gps",
                 "output": "json",
             },
         )
+        locations = payload.get("locations")
+        if not isinstance(locations, str) or not locations.strip():
+            raise POIServiceError("Amap coordinate conversion returned invalid data")
+        converted = _parse_location(locations.split(";")[0])
+        if converted is None:
+            raise POIServiceError("Amap coordinate conversion returned invalid data")
+        return converted
 
-    def _request_pois(
+    def reverse_geocode(
+        self,
+        *,
+        latitude: float,
+        longitude: float,
+    ) -> dict[str, str]:
+        """Return only coarse administrative fields for a GCJ-02 coordinate."""
+
+        if not _valid_coordinate(longitude, latitude):
+            raise POIServiceError("Invalid reverse geocode input")
+        payload = self._request_json(
+            AMAP_REVERSE_GEOCODE_PATH,
+            params={
+                "location": f"{float(longitude):.6f},{float(latitude):.6f}",
+                "extensions": "base",
+                "output": "json",
+            },
+        )
+        regeocode = payload.get("regeocode")
+        if not isinstance(regeocode, Mapping):
+            raise POIServiceError("Amap reverse geocode returned invalid data")
+        component = regeocode.get("addressComponent")
+        if not isinstance(component, Mapping):
+            raise POIServiceError("Amap reverse geocode returned invalid data")
+
+        province = _optional_text(component.get("province"))
+        city = _optional_text(component.get("city"))
+        district = _optional_text(component.get("district"))
+        # extensions=base 已经返回 addressComponent.township（街道/乡镇）。
+        # 部分坐标该字段为空，此时退回同级的 streetNumber.street 街道名。
+        # streetNumber.number（门牌号）、neighborhood（小区）、building（楼栋）
+        # 以及顶层的 formatted_address 一律不读取、不返回。
+        township = _optional_text(component.get("township"))
+        street = None
+        if township is None:
+            street_number = component.get("streetNumber")
+            if isinstance(street_number, Mapping):
+                street = _optional_text(street_number.get("street"))
+        subdistrict = township or street
+
+        parts: list[str] = []
+        for value in (province, city, district, subdistrict):
+            if value and value not in parts:
+                parts.append(value)
+        if not parts:
+            raise POIServiceError("Amap reverse geocode returned no coarse location")
+
+        result = {"label": "".join(parts)}
+        if province:
+            result["province"] = province
+        if city:
+            result["city"] = city
+        if district:
+            result["district"] = district
+        if township:
+            result["township"] = township
+        elif street:
+            result["street"] = street
+        return result
+
+    def _request_json(
         self,
         path: str,
         *,
         params: Mapping[str, Any],
-    ) -> list[dict[str, Any]]:
+    ) -> Mapping[str, Any]:
         request_params = dict(params)
         request_params["key"] = self._api_key
         try:
@@ -137,6 +223,15 @@ class AmapPOIProvider:
             raise POIServiceError("Amap POI returned invalid JSON")
         if str(payload.get("status")) != "1" or str(payload.get("infocode")) != "10000":
             raise POIServiceError("Amap POI returned an unsuccessful status")
+        return payload
+
+    def _request_pois(
+        self,
+        path: str,
+        *,
+        params: Mapping[str, Any],
+    ) -> list[dict[str, Any]]:
+        payload = self._request_json(path, params=params)
 
         raw_pois = payload.get("pois")
         if not isinstance(raw_pois, list):

@@ -12,6 +12,13 @@ import knowledge_base_tool as kb_tool
 
 TEST_VISITOR_ID = "11111111-1111-4111-8111-111111111111"
 OTHER_VISITOR_ID = "22222222-2222-4222-8222-222222222222"
+TEST_CURRENT_LOCATION = {
+    "latitude": 34.7466,
+    "longitude": 113.6254,
+    "accuracy_m": 15.0,
+    "coordinate_system": "wgs84",
+    "source": "browser_geolocation",
+}
 
 
 def response_with_content(content: str):
@@ -259,6 +266,58 @@ class AgentServiceTests(unittest.TestCase):
         self.assertEqual(result["status"], "success")
         weather_tool.assert_called_once_with(location="郑州")
 
+    @patch.object(service, "get_weather", return_value=weather_status("success"))
+    def test_weather_dispatcher_injects_server_current_location(self, weather_tool):
+        result = service.execute_tool_call(
+            service.WEATHER_TOOL_NAME,
+            {"use_current_location": True},
+            TEST_VISITOR_ID,
+            current_location=TEST_CURRENT_LOCATION,
+        )
+
+        self.assertEqual(result["status"], "success")
+        weather_tool.assert_called_once_with(
+            use_current_location=True,
+            current_location=TEST_CURRENT_LOCATION,
+        )
+
+    @patch.object(service, "get_weather")
+    def test_weather_dispatcher_rejects_ambiguous_location_choice(self, weather_tool):
+        invalid_arguments = (
+            {"location": "北京", "use_current_location": True},
+            {},
+            {"use_current_location": False},
+        )
+        for arguments in invalid_arguments:
+            with self.subTest(arguments=arguments):
+                with self.assertRaises(service.ToolDispatchError) as caught:
+                    service.execute_tool_call(
+                        service.WEATHER_TOOL_NAME,
+                        arguments,
+                        TEST_VISITOR_ID,
+                        current_location=TEST_CURRENT_LOCATION,
+                    )
+                self.assertEqual(caught.exception.status, "invalid_tool_arguments")
+        weather_tool.assert_not_called()
+
+    @patch.object(service, "get_weather")
+    def test_weather_dispatcher_rejects_model_coordinates(self, weather_tool):
+        forbidden_arguments = (
+            {"use_current_location": True, "latitude": 34.7},
+            {"use_current_location": True, "longitude": 113.6},
+            {"latitude": 34.7, "longitude": 113.6},
+        )
+        for arguments in forbidden_arguments:
+            with self.subTest(arguments=arguments):
+                with self.assertRaises(service.ToolDispatchError):
+                    service.execute_tool_call(
+                        service.WEATHER_TOOL_NAME,
+                        arguments,
+                        TEST_VISITOR_ID,
+                        current_location=TEST_CURRENT_LOCATION,
+                    )
+        weather_tool.assert_not_called()
+
     @patch.object(service, "get_weather")
     def test_weather_extra_argument_is_rejected(self, weather_tool):
         client = make_client(
@@ -374,6 +433,105 @@ class AgentServiceTests(unittest.TestCase):
         self.assertFalse(service.should_force_weather("RAG和天气有什么关系？"))
         self.assertFalse(service.should_force_weather("今天天气怎么样？"))
         self.assertFalse(service.should_force_weather("郑州明天天气怎么样？"))
+
+    def test_current_location_weather_intent_is_narrowly_detected(self):
+        self.assertTrue(service.should_use_current_location_for_weather("我这里天气怎么样？"))
+        self.assertTrue(service.should_use_current_location_for_weather("当前位置天气怎么样？"))
+        self.assertTrue(service.should_use_current_location_for_weather("我这边现在天气如何？"))
+        self.assertFalse(service.should_use_current_location_for_weather("北京天气怎么样？"))
+        self.assertFalse(service.should_use_current_location_for_weather("北京这里天气怎么样？"))
+        self.assertFalse(service.should_use_current_location_for_weather("我这里明天天气怎么样？"))
+
+    @patch.object(service, "get_weather", return_value=weather_status("success"))
+    def test_current_location_weather_uses_server_context_without_gps_leak(
+        self,
+        weather_tool,
+    ):
+        original_messages = copy.deepcopy(self.messages)
+        client = make_client(
+            response_with_tool_calls(
+                make_tool_call(
+                    '{"use_current_location":true}',
+                    name=service.WEATHER_TOOL_NAME,
+                )
+            ),
+            response_with_content("当前位置天气晴，气温 28℃。"),
+        )
+
+        with patch.object(service, "_get_chat_client", return_value=client):
+            result = service.run_agent_turn(
+                TEST_VISITOR_ID,
+                "我这里天气怎么样？",
+                self.messages,
+                current_location=TEST_CURRENT_LOCATION,
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["mode"], "tool")
+        self.assertEqual(result["sources"], [])
+        weather_tool.assert_called_once_with(
+            use_current_location=True,
+            current_location=TEST_CURRENT_LOCATION,
+        )
+        first_call = client.chat.completions.create.call_args_list[0]
+        self.assertEqual(
+            first_call.kwargs["tool_choice"],
+            service.FORCED_WEATHER_TOOL_CHOICE,
+        )
+        all_api_messages = json.dumps(
+            [
+                call.kwargs["messages"]
+                for call in client.chat.completions.create.call_args_list
+            ],
+            ensure_ascii=False,
+        )
+        self.assertNotIn("34.7466", all_api_messages)
+        self.assertNotIn("113.6254", all_api_messages)
+        self.assertNotIn("accuracy_m", all_api_messages)
+        self.assertEqual(self.messages, original_messages)
+
+    def test_current_location_weather_without_gps_returns_deterministic_guidance(self):
+        with (
+            patch.object(service, "_get_chat_client") as chat_client,
+            patch.object(service, "get_weather") as weather_tool,
+        ):
+            result = service.run_agent_turn(
+                TEST_VISITOR_ID,
+                "当前位置天气怎么样？",
+                self.messages,
+                current_location=None,
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertIn("需要先获取你的位置", result["answer"])
+        self.assertEqual(result["sources"], [])
+        chat_client.assert_not_called()
+        weather_tool.assert_not_called()
+
+    @patch.object(service, "get_weather", return_value=weather_status("success"))
+    def test_explicit_city_weather_has_priority_over_current_location(
+        self,
+        weather_tool,
+    ):
+        client = make_client(
+            response_with_tool_calls(
+                make_tool_call(
+                    '{"location":"北京"}',
+                    name=service.WEATHER_TOOL_NAME,
+                )
+            ),
+            response_with_content("北京当前天气晴。"),
+        )
+        with patch.object(service, "_get_chat_client", return_value=client):
+            result = service.run_agent_turn(
+                TEST_VISITOR_ID,
+                "北京天气怎么样？",
+                self.messages,
+                current_location=TEST_CURRENT_LOCATION,
+            )
+
+        self.assertTrue(result["ok"])
+        weather_tool.assert_called_once_with(location="北京")
 
     def test_future_forecast_is_declined_without_current_weather_tool(self):
         with (
@@ -826,6 +984,41 @@ class AgentServiceTests(unittest.TestCase):
             anchor="故宫",
         )
 
+    @patch.object(service, "search_poi", return_value=poi_status())
+    def test_poi_dispatcher_injects_server_current_location(self, poi_tool):
+        result = service.execute_tool_call(
+            service.POI_TOOL_NAME,
+            {"query": "咖啡店", "use_current_location": True},
+            TEST_VISITOR_ID,
+            current_location=TEST_CURRENT_LOCATION,
+        )
+
+        self.assertEqual(result["status"], "results")
+        poi_tool.assert_called_once_with(
+            query="咖啡店",
+            use_current_location=True,
+            current_location=TEST_CURRENT_LOCATION,
+        )
+
+    @patch.object(service, "search_poi")
+    def test_poi_current_location_rejects_city_anchor_and_coordinates(self, poi_tool):
+        invalid_arguments = (
+            {"query": "餐厅", "use_current_location": True, "city": "北京"},
+            {"query": "餐厅", "use_current_location": True, "anchor": "故宫"},
+            {"query": "餐厅", "use_current_location": True, "latitude": 34.7},
+            {"query": "餐厅", "use_current_location": True, "longitude": 113.6},
+        )
+        for arguments in invalid_arguments:
+            with self.subTest(arguments=arguments):
+                with self.assertRaises(service.ToolDispatchError):
+                    service.execute_tool_call(
+                        service.POI_TOOL_NAME,
+                        arguments,
+                        TEST_VISITOR_ID,
+                        current_location=TEST_CURRENT_LOCATION,
+                    )
+        poi_tool.assert_not_called()
+
     def test_poi_missing_query_is_rejected(self):
         with self.assertRaises(service.ToolDispatchError) as caught:
             service.execute_tool_call(
@@ -843,6 +1036,251 @@ class AgentServiceTests(unittest.TestCase):
                 TEST_VISITOR_ID,
             )
         self.assertEqual(caught.exception.status, "invalid_tool_arguments")
+
+    def test_current_location_poi_intent_is_narrowly_detected(self):
+        self.assertTrue(service.should_use_current_location_for_poi("我附近有什么好吃的？"))
+        self.assertTrue(service.should_use_current_location_for_poi("附近有什么咖啡店？"))
+        self.assertTrue(service.should_use_current_location_for_poi("离我最近的公园有哪些？"))
+        self.assertFalse(service.should_use_current_location_for_poi("故宫附近有什么餐厅？"))
+        self.assertFalse(service.should_use_current_location_for_poi("北京有什么好玩的？"))
+        self.assertFalse(service.should_use_current_location_for_poi("我这里天气怎么样？"))
+
+    @patch.object(service, "search_poi", return_value=poi_status())
+    def test_current_location_poi_is_forced_and_gps_stays_out_of_messages(
+        self,
+        poi_tool,
+    ):
+        original = copy.deepcopy(self.messages)
+        client = make_client(
+            response_with_tool_calls(
+                make_tool_call(
+                    '{"query":"咖啡店","use_current_location":true}',
+                    name=service.POI_TOOL_NAME,
+                )
+            ),
+            response_with_content("附近可以考虑这些咖啡店。"),
+        )
+        with patch.object(service, "_get_chat_client", return_value=client):
+            result = service.run_agent_turn(
+                TEST_VISITOR_ID,
+                "附近有什么咖啡店？",
+                self.messages,
+                current_location=TEST_CURRENT_LOCATION,
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["sources"], [])
+        self.assertEqual(
+            client.chat.completions.create.call_args_list[0].kwargs["tool_choice"],
+            service.FORCED_POI_TOOL_CHOICE,
+        )
+        poi_tool.assert_called_once_with(
+            query="咖啡店",
+            use_current_location=True,
+            current_location=TEST_CURRENT_LOCATION,
+        )
+        serialized_messages = json.dumps(
+            [call.kwargs["messages"] for call in client.chat.completions.create.call_args_list],
+            ensure_ascii=False,
+        )
+        self.assertNotIn("34.7466", serialized_messages)
+        self.assertNotIn("113.6254", serialized_messages)
+        self.assertNotIn("accuracy_m", serialized_messages)
+        self.assertEqual(self.messages, original)
+        self.assertNotIn("34.7466", json.dumps(result, ensure_ascii=False))
+
+    def test_current_location_poi_without_gps_requests_location(self):
+        with (
+            patch.object(service, "_get_chat_client") as client,
+            patch.object(service, "search_poi") as poi_tool,
+        ):
+            result = service.run_agent_turn(
+                TEST_VISITOR_ID,
+                "我附近有什么好玩的？",
+                self.messages,
+                current_location=None,
+            )
+
+        self.assertIn("需要先获取你的位置", result["answer"])
+        client.assert_not_called()
+        poi_tool.assert_not_called()
+
+    def test_current_location_question_without_gps_is_deterministic(self):
+        with (
+            patch.object(service, "_get_chat_client") as client,
+            patch.object(service, "resolve_current_location") as resolver,
+        ):
+            result = service.run_agent_turn(
+                TEST_VISITOR_ID,
+                "我现在在哪？",
+                self.messages,
+                current_location=None,
+            )
+
+        self.assertEqual(result["answer"], "需要先获取你的位置。")
+        client.assert_not_called()
+        resolver.assert_not_called()
+
+    def test_current_location_question_returns_only_coarse_context(self):
+        resolved = {
+            **TEST_CURRENT_LOCATION,
+            "province": "河南省",
+            "city": "郑州市",
+            "district": "金水区",
+            "label": "河南省郑州市金水区",
+        }
+        with (
+            patch.object(
+                service,
+                "resolve_current_location",
+                return_value=resolved,
+            ) as resolver,
+            patch.object(service, "_get_chat_client") as client,
+        ):
+            result = service.run_agent_turn(
+                TEST_VISITOR_ID,
+                "我当前在哪？",
+                self.messages,
+                current_location=TEST_CURRENT_LOCATION,
+            )
+
+        self.assertIn("河南省郑州市金水区附近", result["answer"])
+        self.assertEqual(
+            result["location_context_update"],
+            {
+                "province": "河南省",
+                "city": "郑州市",
+                "district": "金水区",
+                "label": "河南省郑州市金水区",
+            },
+        )
+        serialized = json.dumps(result, ensure_ascii=False)
+        self.assertNotIn("34.7466", serialized)
+        self.assertNotIn("113.6254", serialized)
+        resolver.assert_called_once_with(TEST_CURRENT_LOCATION)
+        client.assert_not_called()
+
+    def test_current_location_question_includes_township_level(self):
+        resolved = {
+            **TEST_CURRENT_LOCATION,
+            "province": "河南省",
+            "city": "郑州市",
+            "district": "中原区",
+            "township": "莲湖街道",
+            "label": "河南省郑州市中原区莲湖街道",
+        }
+        with (
+            patch.object(
+                service,
+                "resolve_current_location",
+                return_value=resolved,
+            ),
+            patch.object(service, "_get_chat_client") as client,
+        ):
+            result = service.run_agent_turn(
+                TEST_VISITOR_ID,
+                "我现在在哪？",
+                self.messages,
+                current_location=TEST_CURRENT_LOCATION,
+            )
+
+        self.assertEqual(
+            result["answer"],
+            "根据你授权的当前位置，你目前位于河南省郑州市中原区莲湖街道附近。",
+        )
+        self.assertEqual(
+            result["location_context_update"],
+            {
+                "province": "河南省",
+                "city": "郑州市",
+                "district": "中原区",
+                "township": "莲湖街道",
+                "label": "河南省郑州市中原区莲湖街道",
+            },
+        )
+        serialized = json.dumps(result, ensure_ascii=False)
+        self.assertNotIn("34.7466", serialized)
+        self.assertNotIn("113.6254", serialized)
+        self.assertNotIn("accuracy_m", serialized)
+        client.assert_not_called()
+
+    def test_current_location_poi_empty_result_never_asks_for_a_city(self):
+        empty = {
+            "ok": True,
+            "status": "no_results",
+            "message": (
+                "当前位置约3km范围内暂未找到符合条件的地点，"
+                "可以换一种类型，例如公园、商场或咖啡店。"
+            ),
+            "query": "景点",
+            "city": service.CURRENT_LOCATION_CITY,
+            "search_mode": "nearby",
+            "anchor": None,
+            "result_count": 0,
+            "results": [],
+        }
+        client = make_client(
+            response_with_tool_calls(
+                make_tool_call(
+                    '{"query":"景点","use_current_location":true}',
+                    name=service.POI_TOOL_NAME,
+                )
+            ),
+            response_with_content("你可以告诉我城市或者附近地标。"),
+        )
+        with (
+            patch.object(service, "search_poi", return_value=empty),
+            patch.object(service, "_get_chat_client", return_value=client),
+        ):
+            result = service.run_agent_turn(
+                TEST_VISITOR_ID,
+                "我附近有什么好玩的？",
+                self.messages,
+                current_location=TEST_CURRENT_LOCATION,
+            )
+
+        self.assertEqual(result["answer"], empty["message"])
+        for phrase in ("城市", "地标", "具体地点"):
+            self.assertNotIn(phrase, result["answer"])
+
+    @patch.object(service, "search_poi")
+    def test_city_poi_empty_result_is_left_to_the_model(self, poi_tool):
+        poi_tool.return_value = {
+            "ok": True,
+            "status": "no_results",
+            "message": "没有找到符合条件的地点，可以尝试更换关键词或提供更具体的位置。",
+            "query": "景点",
+            "city": "北京",
+            "search_mode": "city",
+            "anchor": None,
+            "result_count": 0,
+            "results": [],
+        }
+        client = make_client(
+            response_with_tool_calls(
+                make_tool_call(
+                    '{"query":"景点","city":"北京"}',
+                    name=service.POI_TOOL_NAME,
+                )
+            ),
+            response_with_content("北京暂时没找到合适的景点，换个关键词试试。"),
+        )
+        with patch.object(service, "_get_chat_client", return_value=client):
+            result = service.run_agent_turn(
+                TEST_VISITOR_ID,
+                "北京有什么好玩的？",
+                self.messages,
+                current_location=TEST_CURRENT_LOCATION,
+            )
+
+        poi_tool.assert_called_once_with(query="景点", city="北京", anchor=None)
+        self.assertEqual(
+            result["answer"],
+            "北京暂时没找到合适的景点，换个关键词试试。",
+        )
+
+    def test_max_tool_steps_is_still_three(self):
+        self.assertEqual(service.MAX_TOOL_STEPS, 3)
 
     @patch.object(service, "search_poi")
     def test_poi_unknown_or_server_fields_are_rejected(self, poi_tool):
@@ -879,6 +1317,7 @@ class AgentServiceTests(unittest.TestCase):
                 TEST_VISITOR_ID,
                 "北京故宫附近有什么餐厅？",
                 self.messages,
+                current_location=TEST_CURRENT_LOCATION,
             )
 
         self.assertTrue(result["ok"])
@@ -899,6 +1338,32 @@ class AgentServiceTests(unittest.TestCase):
         )
         self.assertEqual(json.loads(tool_message["content"]), poi_status())
         self.assertFalse(any(message.get("role") == "tool" for message in self.messages))
+
+    @patch.object(service, "search_poi", return_value=poi_status())
+    def test_explicit_poi_city_has_priority_over_current_location(self, poi_tool):
+        client = make_client(
+            response_with_tool_calls(
+                make_tool_call(
+                    '{"query":"景点","city":"北京"}',
+                    name=service.POI_TOOL_NAME,
+                )
+            ),
+            response_with_content("北京可以参观这些景点。"),
+        )
+        with patch.object(service, "_get_chat_client", return_value=client):
+            result = service.run_agent_turn(
+                TEST_VISITOR_ID,
+                "北京有什么好玩的？",
+                self.messages,
+                current_location=TEST_CURRENT_LOCATION,
+            )
+
+        self.assertTrue(result["ok"])
+        poi_tool.assert_called_once_with(query="景点", city="北京", anchor=None)
+        self.assertEqual(
+            client.chat.completions.create.call_args_list[0].kwargs["tool_choice"],
+            "auto",
+        )
 
     @patch.object(service, "search_poi", return_value=poi_status())
     def test_poi_results_create_display_data(self, _poi_tool):
@@ -1202,9 +1667,15 @@ class AgentServiceTests(unittest.TestCase):
 
     def test_poi_argument_schema_declares_required_and_optional_fields(self):
         schema = service.TOOL_ARGUMENT_SCHEMAS[service.POI_TOOL_NAME]
-        self.assertEqual(schema["allowed_fields"], {"query", "city", "anchor"})
-        self.assertEqual(schema["required_fields"], {"query", "city"})
-        self.assertEqual(schema["optional_fields"], {"anchor"})
+        self.assertEqual(
+            schema["allowed_fields"],
+            {"query", "city", "anchor", "use_current_location"},
+        )
+        self.assertEqual(schema["required_fields"], {"query"})
+        self.assertEqual(
+            schema["optional_fields"],
+            {"city", "anchor", "use_current_location"},
+        )
 
     @patch.object(service, "knowledge_base_search")
     def test_first_model_failure_is_sanitized(self, search_tool):
@@ -1293,6 +1764,263 @@ class AgentServiceTests(unittest.TestCase):
             city="郑州",
             anchor=None,
         )
+
+    @patch.object(service, "search_poi", return_value=poi_status())
+    @patch.object(service, "get_weather", return_value=weather_status("success"))
+    def test_gps_weather_then_gps_poi_reuses_server_context(
+        self,
+        weather_tool,
+        poi_tool,
+    ):
+        original_messages = copy.deepcopy(self.messages)
+        client = make_client(
+            response_with_tool_calls(
+                make_tool_call(
+                    '{"use_current_location":true}',
+                    name=service.WEATHER_TOOL_NAME,
+                    call_id="weather-gps",
+                )
+            ),
+            response_with_tool_calls(
+                make_tool_call(
+                    '{"query":"咖啡店","use_current_location":true}',
+                    name=service.POI_TOOL_NAME,
+                    call_id="poi-gps",
+                )
+            ),
+            response_with_content("当前天气不错，可以去附近咖啡店。"),
+        )
+
+        with patch.object(service, "_get_chat_client", return_value=client):
+            result = service.run_agent_turn(
+                TEST_VISITOR_ID,
+                "我这里天气怎么样？如果天气不错，帮我找附近咖啡店。",
+                self.messages,
+                current_location=TEST_CURRENT_LOCATION,
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(client.chat.completions.create.call_count, 3)
+        self.assertEqual(
+            result["tool_names"],
+            [service.WEATHER_TOOL_NAME, service.POI_TOOL_NAME],
+        )
+        self.assertEqual(result["display_data"]["type"], "poi_results")
+        weather_tool.assert_called_once_with(
+            use_current_location=True,
+            current_location=TEST_CURRENT_LOCATION,
+        )
+        poi_tool.assert_called_once_with(
+            query="咖啡店",
+            use_current_location=True,
+            current_location=TEST_CURRENT_LOCATION,
+        )
+        self.assertEqual(service.MAX_TOOL_STEPS, 3)
+        serialized = json.dumps(
+            [call.kwargs["messages"] for call in client.chat.completions.create.call_args_list],
+            ensure_ascii=False,
+        )
+        self.assertNotIn("34.7466", serialized)
+        self.assertNotIn("113.6254", serialized)
+        self.assertEqual(self.messages, original_messages)
+        second_messages = client.chat.completions.create.call_args_list[1].kwargs[
+            "messages"
+        ]
+        pending_hints = [
+            message["content"]
+            for message in second_messages
+            if message.get("role") == "system"
+            and isinstance(message.get("content"), str)
+            and message["content"].startswith(
+                service.PENDING_TASK_INSTRUCTION_PREFIX
+            )
+        ]
+        self.assertEqual(len(pending_hints), 1)
+        self.assertIn(service.WEATHER_TOOL_NAME, pending_hints[0])
+        final_messages = client.chat.completions.create.call_args_list[2].kwargs[
+            "messages"
+        ]
+        tool_payloads = [
+            json.loads(message["content"])
+            for message in final_messages
+            if message.get("role") == "tool"
+        ]
+        self.assertEqual(len(tool_payloads), 2)
+        self.assertEqual(tool_payloads[0]["weather"], "晴")
+        self.assertEqual(tool_payloads[1]["status"], "results")
+
+    @patch.object(service, "search_poi")
+    @patch.object(service, "get_weather", return_value=weather_status("success"))
+    def test_conditional_weather_request_can_finish_without_poi_when_condition_fails(
+        self,
+        weather_tool,
+        poi_tool,
+    ):
+        client = make_client(
+            response_with_tool_calls(
+                make_tool_call(
+                    '{"use_current_location":true}',
+                    name=service.WEATHER_TOOL_NAME,
+                    call_id="weather-gps",
+                )
+            ),
+            response_with_content(
+                "当前天气不适合外出，因此这次不继续搜索附近咖啡店。"
+            ),
+        )
+
+        with patch.object(service, "_get_chat_client", return_value=client):
+            result = service.run_agent_turn(
+                TEST_VISITOR_ID,
+                "我这里天气怎么样？如果天气不错，帮我找附近咖啡店。",
+                self.messages,
+                current_location=TEST_CURRENT_LOCATION,
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["tool_names"], [service.WEATHER_TOOL_NAME])
+        self.assertIn("不继续搜索", result["answer"])
+        self.assertEqual(client.chat.completions.create.call_count, 2)
+        self.assertEqual(
+            client.chat.completions.create.call_args_list[1].kwargs["tool_choice"],
+            "auto",
+        )
+        weather_tool.assert_called_once()
+        poi_tool.assert_not_called()
+
+    @patch.object(service, "search_poi", return_value=poi_status())
+    @patch.object(service, "get_weather", return_value=weather_status("success"))
+    def test_unconditional_gps_weather_then_nearby_cafe_runs_both_tools(
+        self,
+        weather_tool,
+        poi_tool,
+    ):
+        client = make_client(
+            response_with_tool_calls(
+                make_tool_call(
+                    '{"use_current_location":true}',
+                    name=service.WEATHER_TOOL_NAME,
+                    call_id="weather-gps",
+                )
+            ),
+            response_with_tool_calls(
+                make_tool_call(
+                    '{"query":"咖啡店","use_current_location":true}',
+                    name=service.POI_TOOL_NAME,
+                    call_id="poi-gps",
+                )
+            ),
+            response_with_content("已结合天气找到附近咖啡店。"),
+        )
+
+        with patch.object(service, "_get_chat_client", return_value=client):
+            result = service.run_agent_turn(
+                TEST_VISITOR_ID,
+                "查一下这里天气，再帮我找附近咖啡店。",
+                self.messages,
+                current_location=TEST_CURRENT_LOCATION,
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(
+            result["tool_names"],
+            [service.WEATHER_TOOL_NAME, service.POI_TOOL_NAME],
+        )
+        weather_tool.assert_called_once()
+        poi_tool.assert_called_once_with(
+            query="咖啡店",
+            use_current_location=True,
+            current_location=TEST_CURRENT_LOCATION,
+        )
+
+    @patch.object(service, "search_poi", return_value=poi_status())
+    @patch.object(service, "get_weather", return_value=weather_status("success"))
+    def test_gps_weather_then_nearby_meal_recommendation_runs_both_tools(
+        self,
+        weather_tool,
+        poi_tool,
+    ):
+        client = make_client(
+            response_with_tool_calls(
+                make_tool_call(
+                    '{"use_current_location":true}',
+                    name=service.WEATHER_TOOL_NAME,
+                    call_id="weather-gps",
+                )
+            ),
+            response_with_tool_calls(
+                make_tool_call(
+                    '{"query":"餐厅","use_current_location":true}',
+                    name=service.POI_TOOL_NAME,
+                    call_id="poi-gps",
+                )
+            ),
+            response_with_content("已结合天气推荐附近吃饭地点。"),
+        )
+
+        with patch.object(service, "_get_chat_client", return_value=client):
+            result = service.run_agent_turn(
+                TEST_VISITOR_ID,
+                "看看这里天气，然后推荐附近吃饭的地方。",
+                self.messages,
+                current_location=TEST_CURRENT_LOCATION,
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(client.chat.completions.create.call_count, 3)
+        weather_tool.assert_called_once()
+        poi_tool.assert_called_once_with(
+            query="餐厅",
+            use_current_location=True,
+            current_location=TEST_CURRENT_LOCATION,
+        )
+
+    @patch.object(service, "search_poi", return_value=poi_status())
+    @patch.object(service, "get_weather", return_value=weather_status("success"))
+    def test_explicit_city_compound_request_never_uses_session_gps(
+        self,
+        weather_tool,
+        poi_tool,
+    ):
+        client = make_client(
+            response_with_tool_calls(
+                make_tool_call(
+                    '{"location":"北京"}',
+                    name=service.WEATHER_TOOL_NAME,
+                    call_id="weather-beijing",
+                )
+            ),
+            response_with_tool_calls(
+                make_tool_call(
+                    '{"query":"咖啡店","city":"北京","anchor":"故宫"}',
+                    name=service.POI_TOOL_NAME,
+                    call_id="poi-beijing",
+                )
+            ),
+            response_with_content("已结合北京天气推荐故宫附近咖啡店。"),
+        )
+
+        with patch.object(service, "_get_chat_client", return_value=client):
+            result = service.run_agent_turn(
+                TEST_VISITOR_ID,
+                "北京天气怎么样？再帮我找故宫附近咖啡店。",
+                self.messages,
+                current_location=TEST_CURRENT_LOCATION,
+            )
+
+        self.assertTrue(result["ok"])
+        weather_tool.assert_called_once_with(location="北京")
+        poi_tool.assert_called_once_with(
+            query="咖啡店",
+            city="北京",
+            anchor="故宫",
+        )
+        serialized = json.dumps(
+            [call.kwargs["messages"] for call in client.chat.completions.create.call_args_list],
+            ensure_ascii=False,
+        )
+        self.assertNotIn("34.7466", serialized)
+        self.assertNotIn("113.6254", serialized)
 
     @patch.object(service, "get_weather", return_value=weather_status("success"))
     @patch.object(service, "knowledge_base_search", return_value=result_status("results"))

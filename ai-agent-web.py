@@ -69,7 +69,6 @@ NAVIGATION_ITEMS = (
     ("chat", "AI 助手", ":material/auto_awesome:"),
     ("explore", "城市探索", ":material/explore:"),
     ("knowledge", "我的知识库", ":material/library_books:"),
-    ("history", "历史记录", ":material/history:"),
     ("settings", "设置", ":material/settings:"),
 )
 
@@ -147,11 +146,46 @@ def apply_product_styles():
         section[data-testid="stSidebar"] {
             background: #ffffff;
             border-right: 1px solid var(--city-border);
+            --sidebar-title-size: 17px;
+            --sidebar-caption-size: 13px;
+            --sidebar-button-height: 40px;
+            --sidebar-chat-height: 37px;
         }
-        section[data-testid="stSidebar"] .stButton > button {
+        section[data-testid="stSidebar"] h2,
+        section[data-testid="stSidebar"] h3 {
+            font-size: var(--sidebar-title-size);
+            line-height: 1.4;
+            padding: 0;
+        }
+        section[data-testid="stSidebar"] [data-testid="stCaptionContainer"] p {
+            font-size: var(--sidebar-caption-size);
+            line-height: 1.4;
+        }
+        section[data-testid="stSidebar"] [data-testid="stButton"] button {
             justify-content: flex-start;
             border-radius: 10px;
-            min-height: 2.65rem;
+            min-height: var(--sidebar-button-height);
+            padding: 6px 12px;
+        }
+        section[data-testid="stSidebar"] [data-testid="stButton"] button p {
+            font-size: 14px;
+            line-height: 1.3;
+        }
+        section[data-testid="stSidebar"] .st-key-sidebar_recent_list [data-testid="stButton"] button,
+        section[data-testid="stSidebar"] .st-key-sidebar_recent_expanded [data-testid="stButton"] button {
+            min-height: var(--sidebar-chat-height);
+        }
+        section[data-testid="stSidebar"] .st-key-sidebar_recent_expanded {
+            max-height: min(280px, 35vh);
+            max-height: min(280px, 35dvh);
+        }
+        @media (max-width: 700px) {
+            section[data-testid="stSidebar"] {
+                --sidebar-title-size: 16px;
+                --sidebar-caption-size: 12px;
+                --sidebar-button-height: 38px;
+                --sidebar-chat-height: 36px;
+            }
         }
         div[data-testid="stVerticalBlockBorderWrapper"] {
             border-color: var(--city-border);
@@ -445,31 +479,34 @@ def update_title_for_first_user_message(first_message):
 
 def switch_conversation(conversation_id):
     """Switch conversations after confirming ownership for this visitor."""
-    st.session_state.renaming_conversation_id = None
-    if conversation_id == st.session_state.conversation_id:
-        st.session_state.active_view = "chat"
-        st.session_state.suppress_history_restore = False
-        set_blank_chat_requested(False)
-        st.rerun()
+    if conversation_id != st.session_state.conversation_id:
+        try:
+            belongs_to_visitor = conversation_belongs_to_visitor(
+                conversation_id,
+                st.session_state.visitor_id,
+            )
+            if not belongs_to_visitor:
+                return False
 
-    try:
-        belongs_to_visitor = conversation_belongs_to_visitor(
-            conversation_id,
-            st.session_state.visitor_id,
-        )
-        if not belongs_to_visitor:
+            history = get_messages(conversation_id)
+            messages = create_messages_from_history(history)
+        except Exception:
             return False
 
-        history = get_messages(conversation_id)
-    except Exception:
-        return False
+        st.session_state.conversation_id = conversation_id
+        st.session_state.conversation_registered = True
+        st.session_state.messages = messages
 
-    st.session_state.conversation_id = conversation_id
-    st.session_state.conversation_registered = True
+    for state_key in (
+        "pending_prompt",
+        "renaming_conversation_id",
+        "pending_delete_conversation_id",
+        "pending_delete_document_id",
+    ):
+        st.session_state[state_key] = None
     st.session_state.suppress_history_restore = False
     st.session_state.active_view = "chat"
     set_blank_chat_requested(False)
-    st.session_state.messages = create_messages_from_history(history)
     st.rerun()
 
 
@@ -515,16 +552,12 @@ def format_conversation_time(value):
         return str(value)
 
 
-def render_history():
+def render_history(conversations):
     """Render visitor-owned conversations and their management actions."""
     st.title("历史记录")
     st.caption("继续之前的对话，或整理你的聊天标题。")
 
-    try:
-        conversations = get_conversations_by_visitor(
-            st.session_state.visitor_id
-        )
-    except Exception:
+    if conversations is None:
         st.warning("历史记录暂时无法加载，请稍后重试。")
         return
 
@@ -844,6 +877,7 @@ def initialize_ui_state():
     st.session_state.setdefault("renaming_conversation_id", None)
     st.session_state.setdefault("pending_delete_conversation_id", None)
     st.session_state.setdefault("pending_delete_document_id", None)
+    st.session_state.setdefault("recent_chats_expanded", False)
     st.session_state.setdefault("current_location", None)
     st.session_state.setdefault("location_permission_status", "idle")
     st.session_state.setdefault("location_permission_state", "unknown")
@@ -893,16 +927,34 @@ def render_location_controls():
 
     location = st.session_state.current_location
     status = st.session_state.location_permission_status
-    component_result = render_geolocation_button(
-        button_label=location_button_label(
-            attempt_status=status,
-            has_current_location=location is not None,
-        ),
-        auto_attempt=should_attempt_auto_location(
-            has_current_location=location is not None,
-            already_attempted=bool(st.session_state.auto_location_attempted),
-        ),
-    )
+    if status == "granted" and location is not None:
+        status_text = "● 已定位"
+        accuracy_m = location.get("accuracy_m")
+        if isinstance(accuracy_m, (int, float)) and not isinstance(accuracy_m, bool):
+            try:
+                if math.isfinite(accuracy_m) and accuracy_m >= 0:
+                    status_text += f" · 精度{accuracy_m:.0f}米"
+            except OverflowError:
+                pass
+        status_column, button_column = st.columns(
+            [1.6, 1], gap=8, vertical_alignment="center", wrap=True
+        )
+        with status_column:
+            st.caption(status_text)
+    else:
+        button_column = st.container()
+
+    with button_column:
+        component_result = render_geolocation_button(
+            button_label=location_button_label(
+                attempt_status=status,
+                has_current_location=location is not None,
+            ).replace("获取我的位置", "获取位置"),
+            auto_attempt=should_attempt_auto_location(
+                has_current_location=location is not None,
+                already_attempted=bool(st.session_state.auto_location_attempted),
+            ),
+        )
 
     if component_result.location_result is not None:
         apply_browser_location_result(component_result.location_result)
@@ -934,8 +986,6 @@ def render_location_controls():
         st.rerun()
 
     if status == "granted" and location is not None:
-        st.success("当前位置已获取")
-        st.caption(f"定位精度约 {location['accuracy_m']:.0f} 米")
         return
 
     message = location_status_message(
@@ -948,36 +998,108 @@ def render_location_controls():
 
 
 def render_sidebar_navigation():
-    """Render app identity and the single-view product navigation."""
+    """Render navigation and return this run's visitor conversation list."""
     with st.sidebar:
-        st.markdown("### AI 城市生活助手")
-        st.caption("发现城市里的吃喝玩乐")
-        render_location_controls()
-        st.divider()
+        with st.container(key="sidebar_content", gap=20):
+            with st.container(key="sidebar_start", gap=16):
+                with st.container(key="sidebar_identity", gap=12):
+                    st.markdown("### AI 城市生活助手")
+                    with st.container(key="sidebar_location", gap=8):
+                        render_location_controls()
 
-        for view_name, label, icon in NAVIGATION_ITEMS:
-            if st.button(
-                label,
-                key=f"navigation_{view_name}",
-                icon=icon,
-                type=(
-                    "primary"
-                    if st.session_state.active_view == view_name
-                    else "secondary"
-                ),
-                width="stretch",
-            ):
-                select_view(view_name)
-                st.rerun()
+                if st.button(
+                    "新建聊天",
+                    key="sidebar_new_chat",
+                    icon=":material/add:",
+                    width="stretch",
+                ):
+                    start_new_chat()
 
-        st.space("small")
-        if st.button(
-            "新建聊天",
-            key="sidebar_new_chat",
-            icon=":material/add_comment:",
-            width="stretch",
-        ):
-            start_new_chat()
+                with st.container(key="sidebar_navigation", gap=8):
+                    for view_name, label, icon in NAVIGATION_ITEMS:
+                        if st.button(
+                            label,
+                            key=f"navigation_{view_name}",
+                            icon=icon,
+                            type=(
+                                "primary"
+                                if st.session_state.active_view == view_name
+                                else "secondary"
+                            ),
+                            width="stretch",
+                        ):
+                            select_view(view_name)
+                            st.rerun()
+
+            with st.container(key="sidebar_recent", gap=10):
+                with st.container(
+                    key="sidebar_recent_heading",
+                    horizontal=True,
+                    horizontal_alignment="distribute",
+                    vertical_alignment="center",
+                    gap=8,
+                ):
+                    st.subheader("最近聊天", width="content")
+                    if st.button(
+                        "管理 >",
+                        key="recent_conversations_manage",
+                        type="tertiary",
+                        width="content",
+                    ):
+                        select_view("history")
+                        st.rerun()
+
+                conversations = None
+                visitor_id = st.session_state.get("visitor_id")
+                if visitor_id:
+                    try:
+                        conversations = get_conversations_by_visitor(visitor_id)
+                    except Exception:
+                        pass
+
+                if conversations is None:
+                    st.caption("最近聊天暂时无法加载，请稍后重试。")
+                elif not conversations:
+                    st.caption("还没有聊天记录。")
+                else:
+                    expanded = (
+                        st.session_state.recent_chats_expanded and len(conversations) > 3
+                    )
+                    with st.container(
+                        key="sidebar_recent_expanded" if expanded else "sidebar_recent_list",
+                        height=280 if expanded else "content",
+                        border=False,
+                        autoscroll=False,
+                        gap=8,
+                    ):
+                        for conversation in conversations if expanded else conversations[:3]:
+                            conversation_id = conversation["conversation_id"]
+                            title = " ".join(str(conversation.get("title") or "").split())
+                            title = title or "新对话"
+                            if st.button(
+                                escape_markdown(title),
+                                key=f"recent_conversation_{conversation_id}",
+                                type=(
+                                    "primary"
+                                    if st.session_state.conversation_id == conversation_id
+                                    else "secondary"
+                                ),
+                                width="stretch",
+                                wrap=False,
+                            ):
+                                if not switch_conversation(conversation_id):
+                                    st.error("该历史会话暂时无法加载。")
+
+                    if len(conversations) > 3:
+                        if st.button(
+                            "收起" if expanded else "展开全部",
+                            key="recent_conversations_toggle",
+                            width="content",
+                        ):
+                            st.session_state.recent_chats_expanded = not expanded
+                            st.rerun()
+
+    return conversations
 
 
 def render_home_scenario_form(scenario):
@@ -1533,7 +1655,7 @@ initialize_ui_state()
 if "messages" not in st.session_state:
     st.session_state.messages = create_initial_messages()
 
-render_sidebar_navigation()
+conversations = render_sidebar_navigation()
 
 if st.session_state.get("database_warning", False):
     st.caption("聊天记录暂时无法保存，但不影响 AI 对话。")
@@ -1548,7 +1670,7 @@ elif active_view == "explore":
 elif active_view == "knowledge":
     render_knowledge_base()
 elif active_view == "history":
-    render_history()
+    render_history(conversations)
 elif active_view == "settings":
     render_settings()
 else:

@@ -173,9 +173,9 @@ _COMPONENT_CSS = """
 
 _COMPONENT_JS = """
         // 上一次上报给 Python 的权限状态。模块只在组件挂载时求值一次，
-        // 因此同一个 iframe 内不会重复上报同一个状态，避免触发 rerun 循环。
+        // 因此同一个组件实例内不会重复上报同一个状态，避免触发 rerun 循环。
         let reportedPermissionState = null;
-        // 同一个 iframe 内最多自动定位一次。
+        // 同一个组件实例内最多自动定位一次。
         let autoAttempted = false;
         // 请求编号与看门狗放在模块作用域：组件被重新调用时也不会丢失，
         // 否则进行中的请求会被误判为过期，反而把加载态留在页面上。
@@ -229,33 +229,45 @@ _COMPONENT_JS = """
                 setTriggerValue('location_request_state', 'started');
                 watchdog = setTimeout(() => finish(id, 'timeout'), REQUEST_WATCHDOG_MS);
 
-                navigator.geolocation.getCurrentPosition(
-                    (position) => {
-                        finish(id, 'granted', {
-                            latitude: position.coords.latitude,
-                            longitude: position.coords.longitude,
-                            accuracy: position.coords.accuracy,
-                        });
-                    },
-                    (error) => {
-                        const statuses = {
-                            1: 'denied',
-                            2: 'unavailable',
-                            3: 'timeout',
-                        };
-                        finish(id, statuses[error.code] || 'unavailable');
-                    },
-                    {
-                        enableHighAccuracy: true,
-                        timeout: 10000,
-                        maximumAge: 0,
-                    },
-                );
+                try {
+                    navigator.geolocation.getCurrentPosition(
+                        (position) => {
+                            finish(id, 'granted', {
+                                latitude: position.coords.latitude,
+                                longitude: position.coords.longitude,
+                                accuracy: position.coords.accuracy,
+                            });
+                        },
+                        (error) => {
+                            const statuses = {
+                                1: 'denied',
+                                2: 'unavailable',
+                                3: 'timeout',
+                            };
+                            finish(id, statuses[error.code] || 'unavailable');
+                        },
+                        {
+                            enableHighAccuracy: true,
+                            timeout: 10000,
+                            maximumAge: 0,
+                        },
+                    );
+                } catch (error) {
+                    // 部分内置浏览器会同步拒绝调用，不暴露原始错误。
+                    finish(id, 'unavailable');
+                }
             };
 
             // 手动按钮永远可用：即使已有位置也允许用户主动重新定位，
             // 自动定位失败或被看门狗终止后也仍然可以重试。
             button.onclick = requestPosition;
+
+            const attemptAutoLocation = () => {
+                if (data?.auto_attempt && !autoAttempted) {
+                    autoAttempted = true;
+                    requestPosition();
+                }
+            };
 
             const reportPermissionState = (state) => {
                 if (state === reportedPermissionState) {
@@ -270,20 +282,22 @@ _COMPONENT_JS = """
                 return;
             }
 
-            // Permissions API 不可用时保持纯手动模式：既不上报权限状态，
-            // 也绝不自动定位。
+            // Permissions API 不可用不等于 Geolocation 不可用；让浏览器
+            // 自己处理授权，只尝试一次，失败后仍可手动重试。
             const permissions = navigator.permissions;
             if (!permissions || typeof permissions.query !== 'function') {
+                attemptAutoLocation();
                 return;
             }
 
             const applyPermissionState = (state) => {
                 reportPermissionState(state);
-                // 只有浏览器已授权、Python 明确放行、且本 iframe 还没试过时
-                // 才自动定位。prompt 状态绝不能自动请求，否则浏览器会弹出权限框。
-                if (state === 'granted' && data?.auto_attempt && !autoAttempted) {
+                if (state === 'granted' || state === 'prompt') {
+                    attemptAutoLocation();
+                } else if (state === 'denied' && data?.auto_attempt && !autoAttempted) {
+                    // 已拒绝时不请求 GPS，同时消耗本次自动机会，防止 rerun 重试。
                     autoAttempted = true;
-                    requestPosition();
+                    setTriggerValue('location_request_state', 'finished');
                 }
             };
 
@@ -292,13 +306,12 @@ _COMPONENT_JS = """
                     .query({ name: 'geolocation' })
                     .then((status) => {
                         applyPermissionState(status.state);
-                        // 用户在浏览器设置里改动权限时只刷新 UI 状态，
-                        // 不自动发起定位请求。
+                        // 自动机会已消耗后，权限变化只刷新 UI，不再请求 GPS。
                         status.onchange = () => applyPermissionState(status.state);
                     })
-                    .catch(() => {});
+                    .catch(() => attemptAutoLocation());
             } catch (error) {
-                // 查询失败时保持手动按钮可用，不做任何自动请求。
+                attemptAutoLocation();
             }
         }
     """
@@ -332,9 +345,9 @@ def render_geolocation_button(
 ) -> GeolocationComponentResult:
     """Render the location control and return transient browser-reported values.
 
-    ``auto_attempt`` only permits a single automatic ``getCurrentPosition`` call
-    when the browser already reports ``granted``; it never forces the browser
-    permission prompt.
+    ``auto_attempt`` permits one automatic ``getCurrentPosition`` call for
+    ``granted`` / ``prompt`` or when permission querying is unavailable. The
+    browser decides whether to display a permission prompt; ``denied`` skips it.
     """
 
     result = _get_geolocation_component()(

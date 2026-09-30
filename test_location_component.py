@@ -1,5 +1,8 @@
 """Tests for the permission-aware browser geolocation component."""
 
+import json
+import shutil
+import subprocess
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -23,31 +26,33 @@ class ComponentBrowserContractTests(unittest.TestCase):
         self.assertEqual(JS.count("requestPosition();"), 1)
         self.assertIn("button.onclick = requestPosition;", JS)
 
-    def test_auto_location_requires_granted_permission_and_server_approval(self):
+    def test_auto_location_requires_server_approval_and_an_unused_attempt(self):
         auto_call = JS.index("requestPosition();")
         guard = JS[max(0, auto_call - 400) : auto_call]
 
-        self.assertIn("state === 'granted'", guard)
-        self.assertIn("data?.auto_attempt", guard)
-
-    def test_prompt_state_never_triggers_a_position_request(self):
-        # 唯一自动调用点在 granted 守卫之后，prompt 分支没有可执行的调用。
-        auto_call = JS.index("requestPosition();")
-        self.assertNotIn("'prompt'", JS[:auto_call])
-        guard = JS[max(0, auto_call - 400) : auto_call]
-        self.assertIn("state === 'granted'", guard)
         self.assertIn("data?.auto_attempt", guard)
         self.assertIn("!autoAttempted", guard)
 
-    def test_missing_permissions_api_keeps_manual_location_available(self):
-        fallback = JS.index("typeof permissions.query !== 'function'")
+    def test_prompt_and_granted_share_the_one_shot_automatic_entry(self):
+        body = JS.split("const applyPermissionState = ", 1)[1]
+        self.assertIn("state === 'granted' || state === 'prompt'", body)
+        self.assertIn("attemptAutoLocation();", body)
 
-        self.assertNotIn("requestPosition();", JS[:fallback])
+    def test_denied_consumes_the_attempt_without_requesting_a_position(self):
+        body = JS.split("else if (state === 'denied'", 1)[1].split("try {", 1)[0]
+        self.assertIn("autoAttempted = true;", body)
+        self.assertIn("setTriggerValue('location_request_state', 'finished')", body)
+        self.assertNotIn("attemptAutoLocation();", body)
+
+    def test_missing_permissions_api_attempts_once_and_keeps_manual_available(self):
+        fallback = JS.split("typeof permissions.query !== 'function') {", 1)[1]
+        self.assertTrue(fallback.lstrip().startswith("attemptAutoLocation();"))
         self.assertIn("button.onclick = requestPosition;", JS)
 
-    def test_permission_query_failure_is_contained(self):
+    def test_permission_query_failure_uses_the_same_one_shot_fallback(self):
         self.assertIn("} catch (error) {", JS)
-        self.assertIn(".catch(() => {});", JS)
+        self.assertIn(".catch(() => attemptAutoLocation());", JS)
+        self.assertIn("} catch (error) {\n                attemptAutoLocation();", JS)
 
     def test_unsupported_geolocation_reports_a_safe_status(self):
         self.assertIn("window.isSecureContext", JS)
@@ -92,6 +97,159 @@ class ComponentBrowserContractTests(unittest.TestCase):
                 "source",
             },
         )
+
+
+@unittest.skipUnless(shutil.which("node"), "Node.js unavailable; browser mocks skipped")
+class ComponentBrowserExecutionTests(unittest.TestCase):
+    """Execute the shipped JS with browser stubs; no GPS/network/file access.
+
+    Uses an existing Node runtime when available, not a new project dependency.
+    Python guards and structural tests above still run without Node.
+    """
+
+    def test_automatic_and_manual_browser_lifecycle(self):
+        script = "const source = " + json.dumps(JS) + ";\n" + r"""
+const assert = require('node:assert/strict');
+async function browser(permission, options = {}) {
+    const button = { disabled: false }, progress = { textContent: '' };
+    const calls = [], events = [], timers = new Map(), latest = {};
+    const status = { state: permission };
+    const navigator = {
+        geolocation: { getCurrentPosition(...args) {
+            calls.push(args);
+            if (options.geoThrows) throw new Error('private browser error');
+        } },
+        permissions: { query() {
+            if (permission === 'throws') throw new Error('private permission error');
+            if (permission === 'rejects') return Promise.reject(new Error('private error'));
+            return Promise.resolve(status);
+        } },
+    };
+    if (permission === 'missing') delete navigator.permissions;
+    if (permission === 'missing_query') navigator.permissions = {};
+    if (options.noGeolocation) delete navigator.geolocation;
+    let nextTimer = 0;
+    const render = new Function('window', 'navigator', 'setTimeout', 'clearTimeout',
+        source.replace('export default function', 'return function'))(
+        { isSecureContext: options.secure !== false }, navigator,
+        (callback, delay) => { timers.set(++nextTimer, { callback, delay }); return nextTimer; },
+        (id) => timers.delete(id),
+    );
+    const rerun = async (autoAttempt = options.auto !== false) => {
+        render({
+            parentElement: { querySelector: (selector) =>
+                selector === '[data-location-button]' ? button : progress },
+            data: { auto_attempt: autoAttempt, button_label: '重新定位' },
+            setTriggerValue: (key, value) => { events.push([key, value]); latest[key] = value; },
+        });
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+    };
+    await rerun();
+    return { button, progress, calls, events, timers, latest, status, rerun };
+}
+(async () => {
+    // A/B/F/J/K: each permitted state starts once, including navigation/chat reruns.
+    for (const permission of ['granted', 'prompt']) {
+        const b = await browser(permission);
+        assert.equal(b.calls.length, 1, permission);
+        assert.equal(b.button.disabled, true);
+        assert.equal(b.timers.size, 1);
+        assert.equal([...b.timers.values()][0].delay, 15000);
+        assert.deepEqual(b.calls[0][2], { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 });
+        for (const action of ['rerun', 'chat switch', 'navigation return', 'send', 'upload']) {
+            await b.rerun();
+            assert.equal(b.calls.length, 1, action);
+        }
+        b.status.state = 'granted';
+        b.status.onchange();
+        assert.equal(b.calls.length, 1, 'allowing a prompt must not start a second request');
+        // G: success ends loading; subsequent server-guarded or ordinary reruns stay idle.
+        b.calls[0][0]({ coords: { latitude: 1, longitude: 2, accuracy: 20 } });
+        assert.equal(b.latest.location_result.status, 'granted');
+        assert.equal(b.latest.location_request_state, 'finished');
+        assert.equal(b.button.disabled, false);
+        assert.equal(b.timers.size, 0);
+        await b.rerun(false);
+        await b.rerun();
+        assert.equal(b.calls.length, 1);
+        // L: manual re-location bypasses the automatic-attempt guard.
+        b.button.onclick();
+        assert.equal(b.calls.length, 2);
+    }
+    // C: known denial consumes the automatic opportunity but keeps the button.
+    const denied = await browser('denied');
+    assert.equal(denied.calls.length, 0);
+    assert.equal(denied.latest.location_request_state, 'finished');
+    const eventCount = denied.events.length;
+    await denied.rerun();
+    assert.equal(denied.events.length, eventCount);
+    denied.status.state = 'granted';
+    denied.status.onchange();
+    assert.equal(denied.calls.length, 0);
+    denied.button.onclick();
+    assert.equal(denied.calls.length, 1);
+    // D: missing/broken Permissions API still permits exactly one Geolocation call.
+    for (const permission of ['missing', 'missing_query', 'throws', 'rejects']) {
+        const b = await browser(permission);
+        await b.rerun();
+        assert.equal(b.calls.length, 1, permission);
+        b.calls[0][1]({ code: 2 });
+        await b.rerun();
+        assert.equal(b.calls.length, 1);
+        assert.equal(b.button.disabled, false);
+        b.button.onclick();
+        assert.equal(b.calls.length, 2);
+    }
+    // E/F: Python sends auto_attempt=false for an existing location/prior attempt.
+    for (const permission of ['granted', 'prompt', 'missing']) {
+        const b = await browser(permission, { auto: false });
+        await b.rerun(false);
+        assert.equal(b.calls.length, 0);
+        b.button.onclick();
+        assert.equal(b.calls.length, 1);
+    }
+    // H/I: denied/unavailable/timeout keep their distinct outcome and never auto-retry.
+    for (const [code, expected] of [[1, 'denied'], [2, 'unavailable'], [3, 'timeout']]) {
+        const b = await browser('prompt');
+        b.calls[0][1]({ code });
+        assert.equal(b.latest.location_result.status, expected);
+        assert.equal(b.timers.size, 0);
+        await b.rerun();
+        assert.equal(b.calls.length, 1);
+        b.button.onclick();
+        assert.equal(b.calls.length, 2);
+    }
+    const watchdog = await browser('prompt');
+    [...watchdog.timers.values()][0].callback();
+    assert.equal(watchdog.latest.location_result.status, 'timeout');
+    await watchdog.rerun();
+    assert.equal(watchdog.calls.length, 1);
+    watchdog.button.onclick();
+    assert.equal(watchdog.calls.length, 2);
+    const syncFailure = await browser('prompt', { geoThrows: true });
+    assert.equal(syncFailure.latest.location_result.status, 'unavailable');
+    assert.equal(syncFailure.timers.size, 0);
+    await syncFailure.rerun();
+    assert.equal(syncFailure.calls.length, 1);
+    for (const options of [{ secure: false }, { noGeolocation: true }]) {
+        const b = await browser('prompt', options);
+        assert.equal(b.calls.length, 0);
+        assert.equal(b.latest.permission_state, 'unsupported');
+    }
+    // A fresh component/page session requests fresh GPS, not the prior coordinates.
+    assert.equal((await browser('granted')).calls.length, 1);
+})().catch((error) => { console.error(error.message); process.exitCode = 1; });
+"""
+        result = subprocess.run(
+            [shutil.which("node"), "-"],
+            input=script,
+            capture_output=True,
+            encoding="utf-8",
+            timeout=15,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
 
 
 def finish_body():

@@ -103,6 +103,8 @@ EXPLICIT_KNOWLEDGE_BASE_PHRASES = (
     "从我上传的文档里",
     "我的pdf里有没有",
     "我的文档里有没有",
+    "查看知识库里的",
+    "查看我的知识库",
 )
 
 CURRENT_WEATHER_TIME_PHRASES = ("今天", "现在", "当前", "实时")
@@ -125,6 +127,7 @@ CURRENT_LOCATION_PHRASES = (
     "我这里",
     "我这边",
     "这里",
+    "我的位置",
 )
 CURRENT_LOCATION_QUERY_PHRASES = (
     "我现在在哪",
@@ -147,6 +150,14 @@ _WEATHER_NON_LOCATION_PHRASES = (
     "的",
     "是",
     "有",
+    "查一下",
+    "查询",
+    "查看",
+    "告诉我",
+    "帮我",
+    "看看",
+    "根据",
+    "一下",
 )
 
 SOURCE_SECTION_HEADERS = {
@@ -162,6 +173,9 @@ SOURCE_SECTION_HEADERS = {
 }
 
 TOOL_SAFETY_INSTRUCTION = (
+    "用户一次输入可能包含多个独立需求。应完成所有明确、受支持且满足条件的"
+    "子任务，再组织最终答案。一次工具调用成功不代表整个用户请求已经完成。"
+    "不得编造未执行工具的结果。"
     "你可以使用知识库搜索工具查询当前用户上传的 PDF，也可以使用天气工具"
     "查询实时天气，还可以使用 search_poi 搜索真实的餐厅、咖啡店、景点、"
     "商场和其他城市地点。需要真实、当前的地点数据时应优先使用 search_poi，"
@@ -249,6 +263,58 @@ def _has_weather_subject(question: str) -> bool:
     return any(phrase in question for phrase in WEATHER_SUBJECT_PHRASES)
 
 
+def _task_clauses(user_question: Any) -> list[str]:
+    """Separate explicit action transitions, not every comma in a request."""
+
+    return [
+        clause for clause in re.split(
+            r"[。！？!?；;]+|[，,]?(?:然后|并且|同时|再|并)"
+            r"(?=帮我|给我|告诉我|查|查看|找|搜索|推荐|介绍|看看)"
+            r"|[，,](?=附近|我附近|离我|帮我|给我|查|找|推荐|告诉我|查看|如果|假如|若是)",
+            _normalized_question(user_question),
+        ) if clause
+    ]
+
+
+def _unconditional_question(user_question: Any) -> str:
+    # shortcut: complex conditional tails stay model-driven; do not force them.
+    return re.split(
+        r"如果|假如|若是|只要|除非|否则|天气(?:好|不错)再",
+        _normalized_question(user_question), maxsplit=1,
+    )[0]
+
+
+def _explicit_tool_tasks(user_question: Any) -> dict[str, str]:
+    """Keep only clear unconditional requests for the existing tool categories."""
+
+    tasks: dict[str, str] = {}
+    for clause in _task_clauses(_unconditional_question(user_question)):
+        if re.search(r"不要|不用|无需|别查|别找|什么是|为什么|有什么关系", clause):
+            continue
+        if should_force_knowledge_base(clause):
+            tasks.setdefault(KNOWLEDGE_BASE_TOOL_NAME, clause)
+            continue
+        if (
+            _has_weather_subject(clause)
+            and not any(word in clause for word in FUTURE_WEATHER_TIME_PHRASES)
+            and re.search(r"查|看看|告诉|怎么样|如何|多少|冷不冷", clause)
+        ):
+            tasks.setdefault(WEATHER_TOOL_NAME, clause)
+        if (
+            re.search(r"餐厅|咖啡店|火锅|美食|好吃|吃饭|好玩|景点|公园|博物馆|商场|适合去的地方", clause)
+            and re.search(r"找|搜索|推荐|有什么|有哪些|最近", clause)
+        ):
+            tasks.setdefault(POI_TOOL_NAME, clause)
+    return tasks
+
+
+def _weather_clause(user_question: Any) -> str:
+    return next(
+        (clause for clause in _task_clauses(user_question) if _has_weather_subject(clause)),
+        _normalized_question(user_question),
+    )
+
+
 def _has_explicit_location_hint(question: str) -> bool:
     """Detect a location hint without attempting to parse or choose a city."""
 
@@ -262,7 +328,7 @@ def _has_explicit_location_hint(question: str) -> bool:
 def should_force_weather(user_question: Any) -> bool:
     """Return whether this is an explicit, supported current-weather request."""
 
-    question = _normalized_question(user_question)
+    question = _weather_clause(user_question)
     if not question or not _has_weather_subject(question):
         return False
     if any(phrase in question for phrase in FUTURE_WEATHER_TIME_PHRASES):
@@ -275,7 +341,7 @@ def should_force_weather(user_question: Any) -> bool:
 def should_use_current_location_for_weather(user_question: Any) -> bool:
     """Recognize an explicit current-location weather request without a city."""
 
-    question = _normalized_question(user_question)
+    question = _weather_clause(user_question)
     return (
         bool(question)
         and _has_weather_subject(question)
@@ -286,31 +352,33 @@ def should_use_current_location_for_weather(user_question: Any) -> bool:
 
 
 def should_answer_current_location(user_question: Any) -> bool:
-    """Recognize a direct request for the user's authorized coarse location."""
+    """Use the shortcut only when the whole request is a location question."""
 
     question = _normalized_question(user_question)
-    return bool(question) and any(
-        phrase in question for phrase in CURRENT_LOCATION_QUERY_PHRASES
+    return any(
+        re.fullmatch(r"(?:请|请问|告诉我|请告诉我)?" + phrase + r"(?:里|儿|呢|吗)?[？?。!！]*", question)
+        for phrase in CURRENT_LOCATION_QUERY_PHRASES
     )
 
 
 def should_use_current_location_for_poi(user_question: Any) -> bool:
     """Recognize explicit first-person or leading 'nearby' POI intent."""
 
-    question = _normalized_question(user_question)
-    if not question or _has_weather_subject(question):
-        return False
-    return (
-        "我附近" in question
-        or "离我最近" in question
-        or question.startswith("附近")
+    return any(
+        "我附近" in clause
+        or "离我最近" in clause
+        or clause.startswith("附近")
+        or "我的位置" in clause
+        or re.search(r"^(?:帮我|请)?(?:找|搜索|推荐)(?:一下)?附近", clause)
+        for clause in _task_clauses(_unconditional_question(user_question))
+        if not _has_weather_subject(clause)
     )
 
 
 def _is_unsupported_weather_forecast(user_question: Any) -> bool:
     """Recognize forecast intent that the current-only Tool cannot satisfy."""
 
-    question = _normalized_question(user_question)
+    question = _weather_clause(user_question)
     return (
         bool(question)
         and _has_weather_subject(question)
@@ -322,7 +390,7 @@ def _is_unsupported_weather_forecast(user_question: Any) -> bool:
 def _current_weather_needs_location(user_question: Any) -> bool:
     """Recognize current-weather intent that has no usable location hint."""
 
-    question = _normalized_question(user_question)
+    question = _weather_clause(user_question)
     return (
         bool(question)
         and _has_weather_subject(question)
@@ -1003,46 +1071,73 @@ def run_agent_turn(
         return _error("invalid_request", "用户问题不能为空。")
     question = user_question.strip()
     force_knowledge_base = should_force_knowledge_base(question)
+    tasks = _explicit_tool_tasks(question)
+    location_requested = not force_knowledge_base and any(
+        phrase in _normalized_question(question)
+        for phrase in CURRENT_LOCATION_QUERY_PHRASES
+    )
+    compound_request = len(tasks) > 1 or (location_requested and bool(tasks))
+    required_tools = list(tasks) if compound_request else []
+    coarse_update: dict[str, str] = {}
+    location_note = ""
     answer_current_location = (
         not force_knowledge_base
         and should_answer_current_location(question)
     )
-    if answer_current_location:
+    if location_requested:
         try:
             trusted_location = validate_current_location(current_location)
         except LocationContextError:
-            return {
-                "ok": True,
-                "mode": "direct",
-                "answer": "需要先获取你的位置。",
-                "sources": [],
-                "display_data": None,
+            location_note = "需要先获取你的位置。"
+        else:
+            try:
+                resolved_location = resolve_current_location(trusted_location)
+                coarse_update = {
+                    field: resolved_location[field]
+                    for field in sorted(COARSE_LOCATION_FIELDS)
+                    if field in resolved_location
+                }
+                location_note = f"根据你授权的当前位置，你目前位于{resolved_location['label']}附近。"
+            except LocationServiceError:
+                location_note = "暂时无法确定你当前所在的区域，请稍后重试。"
+        if answer_current_location:
+            result = {
+                "ok": True, "mode": "direct", "answer": location_note,
+                "sources": [], "display_data": None,
             }
+            if coarse_update:
+                result["location_context_update"] = coarse_update
+            return result
+
+    gps_tools: set[str] = set()
+    if compound_request:
+        poi_clause = tasks.get(POI_TOOL_NAME, "")
+        weather_clause = tasks.get(WEATHER_TOOL_NAME, "")
+        explicit_weather_place = bool(weather_clause) and _has_explicit_location_hint(weather_clause)
+        first_person_poi = any(word in poi_clause for word in ("我附近", "离我", "我的位置"))
+        if should_use_current_location_for_poi(poi_clause) and (
+            not explicit_weather_place or first_person_poi or location_requested
+        ):
+            gps_tools.add(POI_TOOL_NAME)
+        if weather_clause and (
+            should_use_current_location_for_weather(weather_clause)
+            or (
+                (gps_tools or location_requested)
+                and not _has_explicit_location_hint(weather_clause)
+            )
+        ):
+            gps_tools.add(WEATHER_TOOL_NAME)
+    blocked_tools: set[str] = set()
+    if gps_tools:
         try:
-            resolved_location = resolve_current_location(trusted_location)
-        except LocationServiceError:
-            return {
-                "ok": True,
-                "mode": "direct",
-                "answer": "暂时无法确定你当前所在的区域，请稍后重试。",
-                "sources": [],
-                "display_data": None,
-            }
-        coarse_update = {
-            field: resolved_location[field]
-            for field in sorted(COARSE_LOCATION_FIELDS)
-            if field in resolved_location
-        }
+            validate_current_location(current_location)
+        except LocationContextError:
+            blocked_tools = gps_tools.copy()
+    if required_tools and all(name in blocked_tools for name in required_tools):
         return {
-            "ok": True,
-            "mode": "direct",
-            "answer": (
-                "根据你授权的当前位置，你目前位于"
-                f"{resolved_location['label']}附近。"
-            ),
-            "sources": [],
-            "display_data": None,
-            "location_context_update": coarse_update,
+            "ok": True, "mode": "direct",
+            "answer": "需要先获取你的位置，或者告诉我所在城市或具体地点。",
+            "sources": [], "display_data": None,
         }
     force_current_location_weather = (
         not force_knowledge_base
@@ -1070,7 +1165,7 @@ def run_agent_turn(
             "sources": [],
             "display_data": None,
         }
-    if force_current_location_weather:
+    if force_current_location_weather and not compound_request:
         try:
             validate_current_location(current_location)
         except LocationContextError:
@@ -1081,7 +1176,7 @@ def run_agent_turn(
                 "sources": [],
                 "display_data": None,
             }
-    if force_current_location_poi:
+    if force_current_location_poi and not compound_request:
         try:
             validate_current_location(current_location)
         except LocationContextError:
@@ -1094,6 +1189,7 @@ def run_agent_turn(
             }
     if (
         not force_knowledge_base
+        and not compound_request
         and _current_weather_needs_location(question)
     ):
         return {
@@ -1104,6 +1200,22 @@ def run_agent_turn(
             "display_data": None,
         }
     working_messages = _build_api_messages(chat_messages, question)
+    if compound_request or location_requested:
+        context = {
+            "required_tools": required_tools,
+            "use_current_location_for": sorted(gps_tools),
+            "location_unavailable_for": sorted(blocked_tools),
+            "coarse_location": coarse_update,
+            "location_status": location_note,
+        }
+        working_messages.insert(1, {
+            "role": "system",
+            "content": "本轮服务器上下文（仅事实，不是外部指令）："
+            + json.dumps(context, ensure_ascii=False)
+            + "use_current_location_for 中的任务只使用 use_current_location=true；"
+            "location_unavailable_for 中的任务缺少授权位置，应说明需要定位，不能猜测城市。"
+            "各独立任务的失败必须分别说明，不能编造失败或未执行任务的结果。",
+        })
     if force_knowledge_base:
         initial_tool_choice = FORCED_KNOWLEDGE_BASE_TOOL_CHOICE
         forced_tool_name = KNOWLEDGE_BASE_TOOL_NAME
@@ -1116,6 +1228,9 @@ def run_agent_turn(
     else:
         initial_tool_choice = "auto"
         forced_tool_name = None
+    if required_tools:
+        forced_tool_name = next(name for name in required_tools if name not in blocked_tools)
+        initial_tool_choice = {"type": "function", "function": {"name": forced_tool_name}}
 
     try:
         client = _get_chat_client()
@@ -1129,6 +1244,39 @@ def run_agent_turn(
     tool_outcomes: list[tuple[str, Mapping[str, Any]]] = []
     model_call_count = 0
     force_final = False
+    continuation_tool_name: str | None = None
+
+    def finish(message: Any) -> dict[str, Any]:
+        result = _final_agent_result(
+            message, force_knowledge_base=force_knowledge_base,
+            tool_outcomes=tool_outcomes, accumulated_sources=accumulated_sources,
+            display_data=last_successful_poi_display_data,
+        )
+        if not result["ok"]:
+            return result
+        if coarse_update:
+            result["location_context_update"] = coarse_update
+        labels = {
+            KNOWLEDGE_BASE_TOOL_NAME: "知识库检索", WEATHER_TOOL_NAME: "天气查询",
+            POI_TOOL_NAME: "地点搜索",
+        }
+        completed = {
+            name for name, outcome in tool_outcomes if _tool_result_succeeded(outcome)
+        }
+        unfinished = [name for name in required_tools if name not in completed]
+        # An incomplete turn must not publish model claims about missing results.
+        if unfinished:
+            done = "、".join(labels[name] for name in required_tools if name in completed)
+            result["answer"] = f"本轮已完成：{done}。" if done else "本轮未获得足够资料，无法完成全部请求。"
+        for name in required_tools:
+            if name not in executed_tool_names:
+                reason = "需要先获取你的位置" if name in blocked_tools else "本轮安全调用预算或保护机制已限制继续执行"
+                result["answer"] += f"\n\n{labels[name]}尚未完成：{reason}。"
+            elif name not in completed:
+                result["answer"] += f"\n\n{labels[name]}未获得可用结果，无法据此提供相关信息。"
+        if location_note and (not coarse_update or coarse_update["label"] not in result["answer"]):
+            result["answer"] = location_note + "\n\n" + result["answer"]
+        return result
 
     # Reserve the fourth model call for a forced final response. A denied
     # duplicate or second KB request consumes a decision call, but not an
@@ -1138,7 +1286,11 @@ def run_agent_turn(
         and model_call_count < MAX_TOOL_STEPS
         and not force_final
     ):
-        tool_choice = initial_tool_choice if model_call_count == 0 else "auto"
+        expected_tool_name = forced_tool_name if model_call_count == 0 else continuation_tool_name
+        tool_choice = initial_tool_choice if model_call_count == 0 else (
+            {"type": "function", "function": {"name": expected_tool_name}}
+            if expected_tool_name else "auto"
+        )
         call_number = model_call_count + 1
         try:
             response = _create_completion(
@@ -1153,18 +1305,21 @@ def run_agent_turn(
 
         calls = _tool_calls(message)
         if not calls:
-            if model_call_count == 1 and forced_tool_name is not None:
+            if expected_tool_name is not None:
                 return _error(
                     "forced_tool_not_called",
                     "所需工具未能执行，请稍后重试。",
                 )
-            return _final_agent_result(
-                message,
-                force_knowledge_base=force_knowledge_base,
-                tool_outcomes=tool_outcomes,
-                accumulated_sources=accumulated_sources,
-                display_data=last_successful_poi_display_data,
+            remaining = next(
+                (name for name in required_tools
+                 if name not in executed_tool_names and name not in blocked_tools),
+                None,
             )
+            if remaining and model_call_count < MAX_TOOL_STEPS:
+                continuation_tool_name = remaining
+                _append_pending_task_instruction(working_messages, executed_tool_names)
+                continue
+            return finish(message)
 
         if len(calls) > MAX_TOOL_CALLS_PER_RESPONSE:
             return _error(
@@ -1181,9 +1336,8 @@ def run_agent_turn(
         if tool_name not in SUPPORTED_TOOL_NAMES:
             return _error("unknown_tool", "模型请求了不支持的工具。")
         if (
-            model_call_count == 1
-            and forced_tool_name is not None
-            and tool_name != forced_tool_name
+            expected_tool_name is not None
+            and tool_name != expected_tool_name
         ):
             return _error(
                 "forced_tool_mismatch",
@@ -1197,6 +1351,9 @@ def run_agent_turn(
             )
         except ToolDispatchError as exc:
             return _error(exc.status, exc.message)
+
+        if tool_name in gps_tools and parsed_arguments.get("use_current_location") is not True:
+            return _error("invalid_tool_arguments", "工具参数无效。")
 
         call_key = _canonical_tool_call_key(tool_name, parsed_arguments)
         if call_key in executed_call_keys:
@@ -1267,6 +1424,7 @@ def run_agent_turn(
             )
 
         executed_tool_names.append(tool_name)
+        continuation_tool_name = None
         tool_outcomes.append((tool_name, tool_result))
         working_messages.append(_assistant_tool_call_message(message, tool_call))
         working_messages.append(
@@ -1304,10 +1462,4 @@ def run_agent_turn(
             "模型重复请求工具，本轮已安全停止。",
         )
 
-    return _final_agent_result(
-        final_message,
-        force_knowledge_base=force_knowledge_base,
-        tool_outcomes=tool_outcomes,
-        accumulated_sources=accumulated_sources,
-        display_data=last_successful_poi_display_data,
-    )
+    return finish(final_message)

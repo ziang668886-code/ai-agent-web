@@ -2521,5 +2521,336 @@ class AgentServiceTests(unittest.TestCase):
         self.assertEqual(poi_tool.call_count, 2)
 
 
+class CompoundIntentTests(unittest.TestCase):
+    def run_turn(self, question, responses, *, gps=TEST_CURRENT_LOCATION,
+                 weather_result=None, kb_result=None, resolver_error=None):
+        messages = [
+            {"role": "system", "content": "原有 System Prompt"},
+            {"role": "user", "content": question},
+        ]
+        original = copy.deepcopy(messages)
+        client = make_client(*responses)
+        resolved = {**TEST_CURRENT_LOCATION, "city": "郑州市",
+                    "district": "金水区", "label": "郑州市金水区"}
+        with (
+            patch.object(service, "_get_chat_client", return_value=client) as get_client,
+            patch.object(service, "resolve_current_location", return_value=resolved,
+                         side_effect=resolver_error) as resolver,
+            patch.object(service, "get_weather",
+                         return_value=weather_result or weather_status("success")) as weather,
+            patch.object(service, "search_poi", return_value=poi_status()) as poi,
+            patch.object(service, "knowledge_base_search",
+                         return_value=kb_result or result_status("results")) as kb,
+        ):
+            result = service.run_agent_turn(TEST_VISITOR_ID, question, messages,
+                                            current_location=gps)
+        self.assertEqual(messages, original)
+        serialized = json.dumps(
+            [call.kwargs["messages"] for call in client.chat.completions.create.call_args_list],
+            ensure_ascii=False,
+        )
+        for private_value in ("34.7466", "113.6254", "accuracy_m", TEST_VISITOR_ID):
+            self.assertNotIn(private_value, serialized)
+        for call in client.chat.completions.create.call_args_list:
+            self.assertEqual(sum(m.get("role") == "user" and m.get("content") == question
+                                 for m in call.kwargs["messages"]), 1)
+            self.assertFalse(call.kwargs["parallel_tool_calls"])
+        self.assertLessEqual(weather.call_count + poi.call_count + kb.call_count, 3)
+        self.assertLessEqual(client.chat.completions.create.call_count, 4)
+        return result, client, weather, poi, kb, resolver, get_client
+
+    def tool_reply(self, name, *, call_id="call-1", arguments=None):
+        defaults = {
+            service.WEATHER_TOOL_NAME: '{"use_current_location":true}',
+            service.POI_TOOL_NAME: '{"query":"餐厅","use_current_location":true}',
+            service.KNOWLEDGE_BASE_TOOL_NAME: '{"query":"行程"}',
+        }
+        return response_with_tool_calls(make_tool_call(
+            arguments or defaults[name], name=name, call_id=call_id,
+        ))
+
+    def test_pure_location_keeps_no_llm_shortcut(self):
+        result, client, weather, poi, kb, resolver, get_client = self.run_turn(
+            "我现在在哪？", [],
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["mode"], "direct")
+        self.assertIn("郑州市金水区", result["answer"])
+        resolver.assert_called_once()
+        get_client.assert_not_called()
+        self.assertEqual(client.chat.completions.create.call_count, 0)
+        self.assertEqual(weather.call_count + poi.call_count + kb.call_count, 0)
+
+    def test_location_and_food_enters_workflow_and_searches_once(self):
+        for question in ("我现在在哪，附近有什么好吃的推荐？",
+                         "我现在在哪，附近有什么好吃的？"):
+            with self.subTest(question=question):
+                result, client, weather, poi, kb, resolver, _ = self.run_turn(question, [
+                    self.tool_reply(service.POI_TOOL_NAME),
+                    response_with_content("可以考虑工具返回的餐厅。"),
+                ])
+                self.assertTrue(result["ok"])
+                self.assertEqual(result["mode"], "tool")
+                self.assertIn("郑州市金水区", result["answer"])
+                self.assertEqual(result["location_context_update"]["district"], "金水区")
+                self.assertEqual(result["display_data"]["type"], "poi_results")
+                poi.assert_called_once_with(query="餐厅", use_current_location=True,
+                                            current_location=TEST_CURRENT_LOCATION)
+                resolver.assert_called_once()
+                self.assertEqual(client.chat.completions.create.call_count, 2)
+                self.assertEqual(weather.call_count + kb.call_count, 0)
+
+    def test_location_name_failure_does_not_block_valid_gps_search(self):
+        result, _, _, poi, _, _, _ = self.run_turn(
+            "我现在在哪，附近有什么好吃的推荐？", [
+                self.tool_reply(service.POI_TOOL_NAME),
+                response_with_content("已搜索附近餐厅。"),
+            ], resolver_error=service.LocationServiceError("private provider error"),
+        )
+        self.assertTrue(result["ok"])
+        poi.assert_called_once()
+        self.assertIn("暂时无法确定", result["answer"])
+        self.assertNotIn("private", json.dumps(result))
+
+    def test_location_and_food_without_gps_does_not_guess(self):
+        result, _, weather, poi, kb, resolver, get_client = self.run_turn(
+            "我现在在哪，附近有什么好吃的？", [], gps=None,
+        )
+        self.assertIn("需要先获取", result["answer"])
+        self.assertEqual(weather.call_count + poi.call_count + kb.call_count, 0)
+        get_client.assert_not_called()
+        resolver.assert_not_called()
+
+    def test_weather_then_nearby_places_completes_both(self):
+        result, client, weather, poi, _, _, _ = self.run_turn(
+            "查一下现在的天气，再推荐附近适合去的地方。", [
+                self.tool_reply(service.WEATHER_TOOL_NAME),
+                self.tool_reply(service.POI_TOOL_NAME, call_id="poi-1"),
+                response_with_content("结合当前天气推荐附近地点。"),
+            ],
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["tool_names"], [service.WEATHER_TOOL_NAME, service.POI_TOOL_NAME])
+        weather.assert_called_once_with(use_current_location=True,
+                                        current_location=TEST_CURRENT_LOCATION)
+        poi.assert_called_once()
+        self.assertEqual(client.chat.completions.create.call_count, 3)
+
+    def test_cafe_then_weather_completes_both(self):
+        result, _, weather, poi, _, _, _ = self.run_turn(
+            "根据我的位置找咖啡店，并告诉我天气。", [
+                self.tool_reply(service.POI_TOOL_NAME,
+                                arguments='{"query":"咖啡店","use_current_location":true}'),
+                self.tool_reply(service.WEATHER_TOOL_NAME, call_id="weather-1"),
+                response_with_content("咖啡店推荐和当前天气。"),
+            ],
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["tool_names"], [service.POI_TOOL_NAME, service.WEATHER_TOOL_NAME])
+        poi.assert_called_once_with(query="咖啡店", use_current_location=True,
+                                    current_location=TEST_CURRENT_LOCATION)
+        weather.assert_called_once_with(use_current_location=True,
+                                        current_location=TEST_CURRENT_LOCATION)
+
+    def test_knowledge_base_then_nearby_food_preserves_sources(self):
+        result, _, _, poi, kb, _, _ = self.run_turn(
+            "帮我查看知识库里的行程，再找附近餐厅。", [
+                self.tool_reply(service.KNOWLEDGE_BASE_TOOL_NAME),
+                self.tool_reply(service.POI_TOOL_NAME, call_id="poi-1"),
+                response_with_content("行程说明[来源1]，以及附近餐厅。"),
+            ],
+        )
+        self.assertTrue(result["ok"])
+        kb.assert_called_once_with(visitor_id=TEST_VISITOR_ID, query="行程")
+        poi.assert_called_once()
+        self.assertEqual(result["sources"][0]["source_file"], "知识库.pdf")
+        self.assertEqual(len(result["sources"]), 1)
+        self.assertIsNotNone(result["display_data"])
+
+    def test_premature_final_forces_remaining_tool_within_existing_budget(self):
+        result, client, weather, poi, _, _, _ = self.run_turn(
+            "查一下现在的天气，再推荐附近适合去的地方。", [
+                self.tool_reply(service.WEATHER_TOOL_NAME),
+                response_with_content("天气晴，是否需要推荐地点？"),
+                self.tool_reply(service.POI_TOOL_NAME, call_id="poi-1"),
+                response_with_content("天气和附近地点已经一起查询。"),
+            ],
+        )
+        self.assertTrue(result["ok"])
+        self.assertNotIn("是否需要", result["answer"])
+        weather.assert_called_once()
+        poi.assert_called_once()
+        self.assertEqual([call.kwargs["tool_choice"]
+                          for call in client.chat.completions.create.call_args_list],
+                         [service.FORCED_WEATHER_TOOL_CHOICE, "auto",
+                          service.FORCED_POI_TOOL_CHOICE, "none"])
+
+    def test_failed_tool_is_not_retried_and_independent_task_continues(self):
+        result, _, weather, poi, _, _, _ = self.run_turn(
+            "查一下现在的天气，再推荐附近适合去的地方。", [
+                self.tool_reply(service.WEATHER_TOOL_NAME),
+                response_with_content("天气服务不可用。"),
+                self.tool_reply(service.POI_TOOL_NAME, call_id="poi-1"),
+                response_with_content("当前温度28度，已找到附近地点。"),
+            ], weather_result=weather_status("temporarily_unavailable"),
+        )
+        self.assertTrue(result["ok"])
+        weather.assert_called_once()
+        poi.assert_called_once()
+        self.assertIn("天气查询未获得可用结果", result["answer"])
+        self.assertNotIn("28", result["answer"])
+        self.assertIsNotNone(result["display_data"])
+
+    def test_failed_knowledge_base_does_not_publish_invented_itinerary(self):
+        result, _, _, poi, kb, _, _ = self.run_turn(
+            "帮我查看知识库里的行程，再找附近餐厅。", [
+                self.tool_reply(service.KNOWLEDGE_BASE_TOOL_NAME),
+                self.tool_reply(service.POI_TOOL_NAME, call_id="poi-1"),
+                response_with_content("知识库安排了虚构行程，附近还有餐厅。"),
+            ], kb_result=result_status("no_relevant_results"),
+        )
+        self.assertTrue(result["ok"])
+        kb.assert_called_once()
+        poi.assert_called_once()
+        self.assertEqual(result["sources"], [])
+        self.assertNotIn("虚构行程", result["answer"])
+        self.assertIn("知识库检索未获得可用结果", result["answer"])
+        self.assertIsNotNone(result["display_data"])
+
+    def test_missing_gps_does_not_block_independent_knowledge_base(self):
+        result, _, _, poi, kb, _, _ = self.run_turn(
+            "帮我查看知识库里的行程，再找附近餐厅。", [
+                self.tool_reply(service.KNOWLEDGE_BASE_TOOL_NAME),
+                response_with_content("行程说明[来源1]。附近搜索需要授权位置。"),
+            ], gps=None,
+        )
+        self.assertTrue(result["ok"])
+        kb.assert_called_once()
+        poi.assert_not_called()
+        self.assertIn("需要先获取你的位置", result["answer"])
+        self.assertEqual(len(result["sources"]), 1)
+
+    def test_conditional_poi_is_not_forced_after_location_answer(self):
+        result, client, _, poi, _, _, _ = self.run_turn(
+            "我现在在哪，如果天气好再推荐附近餐厅。", [
+                response_with_content("当前无法判断天气条件，不虚构附近餐厅。"),
+            ],
+        )
+        self.assertTrue(result["ok"])
+        poi.assert_not_called()
+        self.assertEqual(client.chat.completions.create.call_args.kwargs["tool_choice"], "auto")
+        self.assertIn("郑州市金水区", result["answer"])
+
+    def test_explicit_city_and_landmark_are_not_replaced_by_gps(self):
+        result, _, weather, poi, _, resolver, _ = self.run_turn(
+            "查一下北京现在的天气，再推荐故宫附近有什么好吃的。", [
+                self.tool_reply(service.WEATHER_TOOL_NAME, arguments='{"location":"北京"}'),
+                self.tool_reply(service.POI_TOOL_NAME, call_id="poi-1",
+                                arguments='{"query":"餐厅","city":"北京","anchor":"故宫"}'),
+                response_with_content("北京天气及故宫附近餐厅。"),
+            ],
+        )
+        self.assertTrue(result["ok"])
+        weather.assert_called_once_with(location="北京")
+        poi.assert_called_once_with(query="餐厅", city="北京", anchor="故宫")
+        resolver.assert_not_called()
+
+    def test_budget_exhaustion_reports_uncompleted_task(self):
+        replies = [self.tool_reply(service.WEATHER_TOOL_NAME, call_id=f"w-{index}",
+                                  arguments=json.dumps({"location": city}))
+                   for index, city in enumerate(("北京", "上海", "广州"))]
+        result, client, weather, poi, _, _, _ = self.run_turn(
+            "查一下北京现在的天气，再找故宫附近餐厅。",
+            replies + [response_with_content("已找到虚构餐厅。")],
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(weather.call_count, 3)
+        poi.assert_not_called()
+        self.assertIn("地点搜索尚未完成", result["answer"])
+        self.assertNotIn("虚构餐厅", result["answer"])
+        self.assertEqual(client.chat.completions.create.call_args.kwargs["tool_choice"], "none")
+
+    def test_city_weather_and_nearby_food_can_share_explicit_city_without_gps(self):
+        result, _, weather, poi, _, _, _ = self.run_turn(
+            "查一下北京现在的天气，再找附近餐厅。", [
+                self.tool_reply(service.WEATHER_TOOL_NAME, arguments='{"location":"北京"}'),
+                self.tool_reply(service.POI_TOOL_NAME, call_id="p-1",
+                                arguments='{"query":"餐厅","city":"北京"}'),
+                response_with_content("北京天气和餐厅推荐。"),
+            ], gps=None,
+        )
+        self.assertTrue(result["ok"])
+        weather.assert_called_once_with(location="北京")
+        poi.assert_called_once_with(query="餐厅", city="北京", anchor=None)
+
+    def test_three_explicit_tools_keep_sources_cards_and_final_call_limit(self):
+        result, client, weather, poi, kb, _, _ = self.run_turn(
+            "帮我查看知识库里的行程，并查一下现在的天气，再找附近餐厅。", [
+                self.tool_reply(service.KNOWLEDGE_BASE_TOOL_NAME),
+                self.tool_reply(service.WEATHER_TOOL_NAME, call_id="w-1"),
+                self.tool_reply(service.POI_TOOL_NAME, call_id="p-1"),
+                response_with_content("行程[来源1]，天气和餐厅推荐。"),
+            ],
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(kb.call_count + weather.call_count + poi.call_count, 3)
+        self.assertEqual(client.chat.completions.create.call_count, 4)
+        self.assertEqual(client.chat.completions.create.call_args.kwargs["tool_choice"], "none")
+        self.assertEqual(len(result["sources"]), 1)
+        self.assertIsNotNone(result["display_data"])
+
+    def test_duplicate_guard_does_not_retry_to_finish_pending_task(self):
+        result, _, weather, poi, _, _, _ = self.run_turn(
+            "查一下现在的天气，再推荐附近适合去的地方。", [
+                self.tool_reply(service.WEATHER_TOOL_NAME, call_id="w-1"),
+                self.tool_reply(service.WEATHER_TOOL_NAME, call_id="w-2"),
+                response_with_content("已有天气结果，搜索已安全停止。"),
+            ],
+        )
+        self.assertTrue(result["ok"])
+        weather.assert_called_once()
+        poi.assert_not_called()
+        self.assertIn("地点搜索尚未完成", result["answer"])
+
+    def test_forced_continuation_mismatch_is_rejected(self):
+        result, _, weather, poi, kb, _, _ = self.run_turn(
+            "查一下现在的天气，再推荐附近适合去的地方。", [
+                self.tool_reply(service.WEATHER_TOOL_NAME),
+                response_with_content("天气已经查询。"),
+                self.tool_reply(service.KNOWLEDGE_BASE_TOOL_NAME, call_id="kb-1"),
+            ],
+        )
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "forced_tool_mismatch")
+        weather.assert_called_once()
+        poi.assert_not_called()
+        kb.assert_not_called()
+
+    def test_current_location_task_rejects_model_invented_city(self):
+        result, _, weather, poi, _, _, _ = self.run_turn(
+            "查一下现在的天气，再推荐附近适合去的地方。", [
+                self.tool_reply(service.WEATHER_TOOL_NAME, arguments='{"location":"郑州"}'),
+            ],
+        )
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "invalid_tool_arguments")
+        weather.assert_not_called()
+        poi.assert_not_called()
+
+    def test_forced_continuation_direct_answer_is_safely_rejected(self):
+        result, _, weather, poi, _, _, _ = self.run_turn(
+            "查一下现在的天气，再推荐附近适合去的地方。", [
+                self.tool_reply(service.WEATHER_TOOL_NAME),
+                response_with_content("天气已经查询。"),
+                response_with_content("这里是未经检索的地点推荐。"),
+            ],
+        )
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "forced_tool_not_called")
+        self.assertEqual(result["answer"], "")
+        weather.assert_called_once()
+        poi.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

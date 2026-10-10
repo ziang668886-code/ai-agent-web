@@ -1,8 +1,10 @@
 import streamlit as st
+import base64
 import hashlib
 import math
 import os
 import uuid
+from pathlib import Path
 from dotenv import load_dotenv
 from volcenginesdkarkruntime import Ark
 
@@ -264,6 +266,83 @@ def apply_product_styles():
         </style>
         """,
         unsafe_allow_html=True,
+    )
+
+
+def render_compliance_footer():
+    """Show public registration links without relying on a static-file server."""
+    icon_html = ""
+    try:
+        icon_path = Path(__file__).resolve().parent / "assets" / "beian.png"
+        icon_data = base64.b64encode(icon_path.read_bytes()).decode("ascii")
+        icon_html = (
+            f'<img src="data:image/png;base64,{icon_data}" alt="公安备案图标">'
+        )
+    except OSError:
+        pass
+
+    st.html(
+        f"""
+        <style>
+        .city-compliance-footer {{
+            margin-top: 2rem;
+            padding: 1rem 0;
+            color: var(--city-muted, #667085);
+            font-size: 12px;
+            line-height: 1.6;
+            text-align: center;
+        }}
+        .city-compliance-footer__links {{
+            display: flex;
+            flex-wrap: wrap;
+            justify-content: center;
+            align-items: center;
+            gap: 0.5rem 0.75rem;
+            margin-top: 0.5rem;
+        }}
+        .city-compliance-footer a {{
+            color: inherit;
+            text-decoration: none;
+            max-width: 100%;
+            overflow-wrap: anywhere;
+        }}
+        .city-compliance-footer a:hover {{ text-decoration: underline; }}
+        .city-compliance-footer__contact {{
+            margin-top: 0.5rem;
+            overflow-wrap: anywhere;
+        }}
+        .city-compliance-footer__security {{
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            min-width: 0;
+        }}
+        .city-compliance-footer img {{
+            height: 18px;
+            width: auto;
+            flex-shrink: 0;
+        }}
+        @media (max-width: 600px) {{
+            .city-compliance-footer__separator {{ display: none; }}
+        }}
+        </style>
+        <footer class="city-compliance-footer" aria-label="网站备案信息">
+            <div>© 2026 AI 城市生活助手</div>
+            <div class="city-compliance-footer__links">
+                <a href="https://beian.miit.gov.cn/" target="_blank"
+                   rel="noopener noreferrer">津ICP备2026014222号</a>
+                <span class="city-compliance-footer__separator" aria-hidden="true">｜</span>
+                <a class="city-compliance-footer__security"
+                   href="https://beian.mps.gov.cn/#/query/webSearch?code=11011402057426"
+                   target="_blank" rel="noopener noreferrer">
+                    {icon_html}<span>京公网安备11011402057426号</span>
+                </a>
+            </div>
+            <div class="city-compliance-footer__contact">
+                联系我们：<a href="mailto:3382783015@qq.com">3382783015@qq.com</a>
+            </div>
+        </footer>
+        """
     )
 
 
@@ -1676,3 +1755,5 @@ elif active_view == "settings":
 else:
     st.session_state.active_view = "home"
     st.rerun()
+
+render_compliance_footer()
